@@ -29,6 +29,11 @@ class LlmEmptyStreamError(LlmRequestError):
 
 DEFAULT_MAX_TOKENS = 2_000
 DEFAULT_REASONING_EFFORT = "high"
+MAX_RESPONSE_SEGMENTS = 4
+CONTINUATION_PROMPT = (
+    "Continue the previous answer exactly from its final character. "
+    "Do not repeat any text, add a new introduction, or mention the output limit."
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,6 +118,34 @@ class DeepSeekProvider:
         messages: Sequence[AgentMessage],
         max_tokens: int = DEFAULT_MAX_TOKENS,
     ) -> str:
+        request_messages = list(messages)
+        parts: list[str] = []
+        for segment_index in range(MAX_RESPONSE_SEGMENTS):
+            content, finish_reason = self._generate_segment(
+                messages=request_messages,
+                max_tokens=max_tokens,
+            )
+            parts.append(content)
+            if finish_reason != "length":
+                return "".join(parts).strip()
+            if segment_index == MAX_RESPONSE_SEGMENTS - 1:
+                break
+            request_messages.extend(
+                [
+                    {"role": "assistant", "content": content},
+                    {"role": "user", "content": CONTINUATION_PROMPT},
+                ],
+            )
+        raise LlmRequestError(
+            "Ответ модели не завершился после нескольких продолжений",
+        )
+
+    def _generate_segment(
+        self,
+        *,
+        messages: Sequence[AgentMessage],
+        max_tokens: int,
+    ) -> tuple[str, str | None]:
         thinking_type = "enabled" if self._thinking_enabled else "disabled"
         request = self._build_chat_request(
             messages=messages,
@@ -122,7 +155,7 @@ class DeepSeekProvider:
         response = self._request_completion(request)
         content, finish_reason = self._extract_content(response)
         if content:
-            return content
+            return content, finish_reason
 
         if thinking_type == "enabled" and finish_reason != "content_filter":
             fallback = self._build_chat_request(
@@ -134,7 +167,7 @@ class DeepSeekProvider:
                 self._request_completion(fallback),
             )
             if content:
-                return content
+                return content, finish_reason
 
         reason = f" (finish_reason={finish_reason})" if finish_reason else ""
         raise LlmRequestError(f"DeepSeek вернул пустой ответ{reason}")

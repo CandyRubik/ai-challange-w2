@@ -3,6 +3,7 @@ from __future__ import annotations
 from functools import lru_cache
 import os
 from pathlib import Path
+from typing import Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -14,12 +15,26 @@ from .providers.deepseek import (
     LlmConfigurationError,
     LlmRequestError,
 )
-from .schemas import ChatSendRequest, ChatSendResponse, ChatSession, ChatSessionSummary
+from .schemas import (
+    ChatSendRequest,
+    ChatSendResponse,
+    ChatSession,
+    ChatSessionSummary,
+    MemoryCreateRequest,
+    MemoryEntry,
+    MemorySnapshot,
+)
 from .services.chat_sessions import (
     ChatSessionNotFound,
     ChatSessionService,
     DEFAULT_CHAT_DB_PATH,
     SQLiteChatSessionRepository,
+)
+from .services.memory import (
+    MemoryNotFound,
+    MemoryService,
+    MemoryValidationError,
+    SQLiteMemoryRepository,
 )
 
 
@@ -39,15 +54,27 @@ app.add_middleware(
     allow_headers=["Content-Type"],
 )
 
+
 @lru_cache(maxsize=1)
 def get_chat_repository() -> SQLiteChatSessionRepository:
     database_path = os.getenv("CHAT_DB_PATH") or str(DEFAULT_CHAT_DB_PATH)
     return SQLiteChatSessionRepository(database_path)
 
 
+@lru_cache(maxsize=1)
+def get_memory_repository() -> SQLiteMemoryRepository:
+    database_path = os.getenv("CHAT_DB_PATH") or str(DEFAULT_CHAT_DB_PATH)
+    get_chat_repository()
+    return SQLiteMemoryRepository(database_path)
+
+
 def get_chat_session_service() -> ChatSessionService:
     agent = Agent(DeepSeekProvider())
-    return ChatSessionService(get_chat_repository(), agent)
+    return ChatSessionService(get_chat_repository(), agent, get_memory_repository())
+
+
+def get_memory_service() -> MemoryService:
+    return MemoryService(get_memory_repository(), get_chat_repository())
 
 
 @app.get("/api/health")
@@ -77,6 +104,43 @@ def clear_chat_sessions(
     service: ChatSessionService = Depends(get_chat_session_service),
 ) -> Response:
     service.clear()
+    return Response(status_code=204)
+
+
+@app.get("/api/memory", response_model=MemorySnapshot)
+def get_memory(
+    session_id: str | None = None,
+    service: MemoryService = Depends(get_memory_service),
+) -> MemorySnapshot:
+    try:
+        return service.snapshot(session_id)
+    except ChatSessionNotFound:
+        raise HTTPException(status_code=404, detail="Чат не найден") from None
+
+
+@app.post("/api/memory", response_model=MemoryEntry, status_code=201)
+def create_memory(
+    request: MemoryCreateRequest,
+    service: MemoryService = Depends(get_memory_service),
+) -> MemoryEntry:
+    try:
+        return service.create(request)
+    except ChatSessionNotFound:
+        raise HTTPException(status_code=404, detail="Чат не найден") from None
+    except MemoryValidationError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from None
+
+
+@app.delete("/api/memory/{layer}/{memory_id}", status_code=204)
+def delete_memory(
+    layer: Literal["working", "long_term"],
+    memory_id: str,
+    service: MemoryService = Depends(get_memory_service),
+) -> Response:
+    try:
+        service.delete(layer, memory_id)
+    except MemoryNotFound:
+        raise HTTPException(status_code=404, detail="Запись памяти не найдена") from None
     return Response(status_code=204)
 
 
