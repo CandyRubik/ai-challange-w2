@@ -52,6 +52,15 @@ def test_frontend_keeps_composer_visible_and_sends_with_enter() -> None:
     assert 'name: "/goal", layer: "working"' in javascript
     assert 'name: "/profile", layer: "long_term"' in javascript
     assert "parsedMemoryCommand(content)" in javascript
+    assert "memorySnapshot = memory" in javascript
+    assert 'id="profile-select"' in markup
+    assert 'id="profile-dialog"' in markup
+    assert 'id="delete-profile"' in markup
+    assert 'api("/api/profiles")' in javascript
+    assert 'api("/api/profiles/auto", { method: "POST" })' in javascript
+    assert "profile.onboarding_complete" in javascript
+    assert 'method: "DELETE"' in javascript
+    assert "profile_id: currentProfileId" in javascript
     assert 'id="command-menu"' in markup
     assert 'id="memory-form"' not in markup
     assert 'id="followup-queue"' in markup

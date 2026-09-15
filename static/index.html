@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="description" content="Чат с агентом и явной моделью памяти" />
+    <meta name="description" content="Чат с агентом и автоматической трёхслойной памятью" />
     <title>Rubik Agent Chat</title>
     <link rel="icon" href="data:," />
     <link rel="stylesheet" href="/styles.css" />
@@ -12,11 +12,19 @@
     <main class="chat-shell">
       <aside class="sidebar">
         <a class="brand" href="/"><span>◇</span> Rubik Agent Chat</a>
+        <section class="profile-switcher" aria-labelledby="profile-switcher-label">
+          <label id="profile-switcher-label" for="profile-select">Профиль</label>
+          <div>
+            <select id="profile-select" aria-label="Активный профиль"></select>
+            <button id="edit-profile" class="icon-button" type="button" title="Проверить или скорректировать профиль" aria-label="Проверить или скорректировать профиль">⚙</button>
+          </div>
+          <button id="new-profile" class="secondary" type="button">＋ Новый пользователь</button>
+        </section>
         <button id="new-session" class="primary" type="button">＋ Новый чат</button>
         <nav id="sessions" aria-label="Сессии чата"></nav>
-        <button id="clear-database" class="danger" type="button">Очистить историю</button>
+        <button id="clear-database" class="danger" type="button">Очистить чаты профиля</button>
 
-        <p class="memory-note">Контекст собирается из трёх явных слоёв. Агент не имеет доступа к коду или окружению.</p>
+        <p class="memory-note">Контекст собирается из трёх слоёв. Важные факты агент сохраняет автоматически.</p>
       </aside>
 
       <section class="conversation" aria-labelledby="chat-title">
@@ -32,7 +40,7 @@
           <div class="empty">
             <span>✦</span>
             <h2>Чем помочь?</h2>
-            <p>Каждая сессия имеет собственную историю диалога.</p>
+            <p>Напишите первую задачу. Перед работой агент коротко познакомится с вами.</p>
           </div>
         </div>
 
@@ -66,10 +74,19 @@
             <p class="eyebrow">MEMORY INSPECTOR</p>
             <h2 id="memory-title">Память агента</h2>
           </div>
-          <span class="explicit-badge">explicit</span>
+          <span class="explicit-badge">auto</span>
         </header>
 
         <div class="memory-layers">
+          <section class="active-profile-card" aria-labelledby="active-profile-name">
+            <div>
+              <span id="active-profile-status">INTERVIEW</span>
+              <strong id="active-profile-name">Основной</strong>
+            </div>
+            <p id="active-profile-summary">Нейтральный · обычная подробность</p>
+            <div id="active-profile-constraints" class="profile-constraints"></div>
+          </section>
+
           <section class="memory-layer short-term">
             <div class="layer-heading">
               <div><span class="layer-dot"></span><strong>Краткосрочная</strong></div>
@@ -93,17 +110,81 @@
               <div><span class="layer-dot"></span><strong>Долговременная</strong></div>
               <span id="long-term-count" class="layer-count">0</span>
             </div>
-            <p class="layer-description">Профиль и знания, общие для всех чатов.</p>
+            <p class="layer-description">Факты и предпочтения во всех чатах этого пользователя.</p>
             <div id="long-term-memory" class="memory-items"></div>
           </section>
         </div>
 
         <section class="command-help">
           <strong>Slash-команды</strong>
-          <p>Введи <kbd>/</kbd> в поле сообщения. Working-команды действуют только в этом чате, long-term — во всех.</p>
+          <p>Профиль строится из короткого интервью. Дальше агент сохраняет важное сам; <kbd>/</kbd> остаётся для ручного контроля памяти.</p>
         </section>
       </aside>
     </main>
+
+    <dialog id="profile-dialog">
+      <form id="profile-form">
+        <header>
+          <div>
+            <p class="eyebrow">PERSONALIZATION</p>
+            <h2 id="profile-dialog-title">Проверка профиля</h2>
+          </div>
+          <button id="close-profile-dialog" class="icon-button" type="button" aria-label="Закрыть">×</button>
+        </header>
+        <input id="profile-id" type="hidden" />
+        <label>
+          Имя профиля
+          <input id="profile-name" maxlength="80" required />
+        </label>
+        <label>
+          Описание пользователя
+          <textarea id="profile-description" rows="2" maxlength="1000" placeholder="Роль, контекст, уровень опыта"></textarea>
+        </label>
+        <div class="profile-form-grid">
+          <label>
+            Язык
+            <select id="profile-language">
+              <option value="ru">Русский</option>
+              <option value="en">English</option>
+            </select>
+          </label>
+          <label>
+            Тон
+            <select id="profile-tone">
+              <option value="neutral">Нейтральный</option>
+              <option value="friendly">Дружелюбный</option>
+              <option value="formal">Формальный</option>
+              <option value="technical">Технический</option>
+            </select>
+          </label>
+          <label>
+            Подробность
+            <select id="profile-detail-level">
+              <option value="brief">Кратко</option>
+              <option value="balanced" selected>Сбалансированно</option>
+              <option value="detailed">Подробно</option>
+            </select>
+          </label>
+          <label>
+            Формат
+            <select id="profile-response-format">
+              <option value="plain">Обычный текст</option>
+              <option value="bullets">Списки</option>
+              <option value="steps">Пошагово</option>
+            </select>
+          </label>
+        </div>
+        <label>
+          Ограничения, по одному на строку
+          <textarea id="profile-constraints-input" rows="3" maxlength="2000" placeholder="Без эмодзи&#10;Сначала краткий вывод"></textarea>
+        </label>
+        <footer>
+          <button id="delete-profile" class="danger" type="button">Удалить профиль</button>
+          <button id="cancel-profile" class="secondary" type="button">Отмена</button>
+          <button class="primary" type="submit">Сохранить профиль</button>
+        </footer>
+      </form>
+    </dialog>
     <script src="/app.js" defer></script>
   </body>
 </html>
