@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from pathlib import Path
+import sqlite3
 
 from fastapi.testclient import TestClient
 import pytest
@@ -35,6 +36,65 @@ def test_frontend_uses_same_origin_api_by_default() -> None:
 
     assert 'window.API_BASE_URL || ""' in javascript
     assert "http://localhost:8000" not in javascript
+
+
+def test_frontend_keeps_composer_visible_and_sends_with_enter() -> None:
+    root = Path(__file__).parents[1]
+    javascript = (root / "static" / "app.js").read_text()
+    styles = (root / "static" / "styles.css").read_text()
+    markup = (root / "static" / "index.html").read_text()
+
+    assert 'input.addEventListener("keydown"' in javascript
+    assert 'event.key === "Enter"' in javascript
+    assert "!event.shiftKey" in javascript
+    assert "form.requestSubmit()" in javascript
+    assert "memoryCommands" in javascript
+    assert 'name: "/goal", layer: "working"' in javascript
+    assert 'name: "/profile", layer: "long_term"' in javascript
+    assert "parsedMemoryCommand(content)" in javascript
+    assert 'id="command-menu"' in markup
+    assert 'id="memory-form"' not in markup
+    assert 'id="followup-queue"' in markup
+    assert "queuedMessages" in javascript
+    assert "enqueueMessage(content)" in javascript
+    assert 'kind: "pending"' in javascript
+    assert "typing-indicator" in styles
+    assert "input.disabled = value" not in javascript
+    assert "grid-template-rows: auto minmax(0, 1fr) auto" in styles
+    assert ".conversation" in styles and "min-height: 0" in styles
+    assert 'class="memory-layers"' in markup
+
+
+def test_repository_migrates_existing_messages_to_message_kind(tmp_path: Path) -> None:
+    database_path = tmp_path / "legacy.sqlite3"
+    with sqlite3.connect(database_path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE chat_sessions (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE chat_messages (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
+                position INTEGER NOT NULL,
+                role TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE (session_id, position)
+            );
+            """,
+        )
+
+    SQLiteChatSessionRepository(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(chat_messages)")
+        }
+    assert "kind" in columns
 
 
 def test_agent_applies_input_and_output_policies() -> None:
@@ -164,6 +224,23 @@ def test_agent_applies_runtime_experiment_options() -> None:
         {"role": "user", "content": "Новый вопрос"},
     ]
     assert max_tokens == 777
+
+
+def test_disabled_context_hides_all_memory_layers() -> None:
+    model = FakeLanguageModel()
+    agent = Agent(model, context_enabled=False)
+
+    agent.respond(
+        [{"role": "user", "content": "Скрытый диалог"}],
+        "Новый вопрос",
+        working_memory=[{"category": "goal", "content": "Скрытая цель"}],
+        long_term_memory=[{"category": "profile", "content": "Скрытый профиль"}],
+    )
+
+    system_prompt = model.calls[0][0][0]["content"]
+    assert "Скрытая цель" not in system_prompt
+    assert "Скрытый профиль" not in system_prompt
+    assert model.calls[0][0][-1]["content"] == "Новый вопрос"
 
 
 def test_chat_session_http_flow(tmp_path: Path) -> None:

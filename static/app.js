@@ -5,11 +5,35 @@ const title = document.querySelector("#chat-title");
 const status = document.querySelector("#status");
 const form = document.querySelector("#message-form");
 const input = document.querySelector("#message-input");
+const submitButton = form.querySelector("button[type='submit']");
 const newButton = document.querySelector("#new-session");
 const clearDatabaseButton = document.querySelector("#clear-database");
+const commandMenu = document.querySelector("#command-menu");
+const followupQueue = document.querySelector("#followup-queue");
+const queuedMessagesContainer = document.querySelector("#queued-messages");
+const queueCount = document.querySelector("#queue-count");
+const shortTermMemory = document.querySelector("#short-term-memory");
+const workingMemory = document.querySelector("#working-memory");
+const longTermMemory = document.querySelector("#long-term-memory");
+const shortTermCount = document.querySelector("#short-term-count");
+const workingCount = document.querySelector("#working-count");
+const longTermCount = document.querySelector("#long-term-count");
 let sessions = [];
 let currentSessionId = null;
+let currentMessages = [];
+let memorySnapshot = { working: [], long_term: [] };
 let busy = false;
+let activeCommandIndex = 0;
+let queuedMessages = [];
+
+const memoryCommands = [
+  { name: "/goal", layer: "working", category: "goal", description: "цель текущей задачи" },
+  { name: "/constraint", layer: "working", category: "constraint", description: "ограничение текущей задачи" },
+  { name: "/decision", layer: "working", category: "decision", description: "решение текущей задачи" },
+  { name: "/profile", layer: "long_term", category: "profile", description: "устойчивый факт профиля" },
+  { name: "/preference", layer: "long_term", category: "preference", description: "предпочтение пользователя" },
+  { name: "/knowledge", layer: "long_term", category: "knowledge", description: "знание для будущих чатов" },
+];
 
 async function api(path, options = {}) {
   const response = await fetch(`${API_BASE_URL}${path}`, {
@@ -29,11 +53,151 @@ async function api(path, options = {}) {
 
 function setBusy(value) {
   busy = value;
-  input.disabled = value;
-  form.querySelector("button").disabled = value;
+  submitButton.textContent = value ? "В очередь" : "Отправить";
   newButton.disabled = value;
   clearDatabaseButton.disabled = value;
   if (value) status.textContent = "Агент отвечает…";
+}
+
+function renderQueue() {
+  queueCount.textContent = String(queuedMessages.length);
+  followupQueue.hidden = queuedMessages.length === 0;
+  queuedMessagesContainer.replaceChildren(...queuedMessages.map((queued, index) => {
+    const item = document.createElement("article");
+    const position = document.createElement("span");
+    position.textContent = String(index + 1);
+    const content = document.createElement("p");
+    content.textContent = queued.content;
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.title = "Убрать из очереди";
+    remove.setAttribute("aria-label", `Убрать из очереди: ${queued.content}`);
+    remove.textContent = "×";
+    remove.addEventListener("click", () => {
+      queuedMessages = queuedMessages.filter((item) => item.id !== queued.id);
+      renderQueue();
+      status.textContent = queuedMessages.length
+        ? `В очереди: ${queuedMessages.length}`
+        : "Очередь очищена";
+    });
+    item.append(position, content, remove);
+    return item;
+  }));
+}
+
+function enqueueMessage(content) {
+  queuedMessages.push({
+    id: globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`,
+    content,
+  });
+  renderQueue();
+  status.textContent = `Агент отвечает · в очереди: ${queuedMessages.length}`;
+}
+
+function commandMatches() {
+  const value = input.value;
+  if (!value.startsWith("/") || /\s/.test(value)) return [];
+  return memoryCommands.filter((command) => command.name.startsWith(value.toLowerCase()));
+}
+
+function hideCommandMenu() {
+  commandMenu.hidden = true;
+  commandMenu.replaceChildren();
+  input.removeAttribute("aria-activedescendant");
+}
+
+function selectCommand(command) {
+  input.value = `${command.name} `;
+  hideCommandMenu();
+  input.focus();
+}
+
+function renderCommandMenu() {
+  const matches = commandMatches();
+  if (!matches.length) {
+    hideCommandMenu();
+    return;
+  }
+
+  activeCommandIndex = Math.min(activeCommandIndex, matches.length - 1);
+  const options = matches.map((command, index) => {
+    const option = document.createElement("button");
+    option.type = "button";
+    option.id = `memory-command-${index}`;
+    option.className = index === activeCommandIndex ? "command-option active" : "command-option";
+    option.setAttribute("role", "option");
+    option.setAttribute("aria-selected", String(index === activeCommandIndex));
+
+    const name = document.createElement("strong");
+    name.textContent = command.name;
+    const description = document.createElement("span");
+    description.textContent = command.description;
+    const layer = document.createElement("small");
+    layer.className = command.layer;
+    layer.textContent = command.layer === "working" ? "WORKING" : "LONG-TERM";
+    option.append(name, description, layer);
+    option.addEventListener("mousedown", (event) => {
+      event.preventDefault();
+      selectCommand(command);
+    });
+    return option;
+  });
+
+  commandMenu.replaceChildren(...options);
+  commandMenu.hidden = false;
+  input.setAttribute("aria-activedescendant", options[activeCommandIndex].id);
+}
+
+function parsedMemoryCommand(content) {
+  const command = memoryCommands.find((candidate) => (
+    content === candidate.name || content.startsWith(`${candidate.name} `)
+  ));
+  if (!command) return null;
+  return { ...command, content: content.slice(command.name.length).trim() };
+}
+
+async function executeMemoryCommand(command) {
+  if (!command.content) {
+    status.textContent = `Добавь текст после ${command.name}`;
+    input.focus();
+    return;
+  }
+
+  setBusy(true);
+  status.textContent = "Сохраняю команду в память…";
+  try {
+    await api("/api/memory", {
+      method: "POST",
+      body: JSON.stringify({
+        layer: command.layer,
+        category: command.category,
+        content: command.content,
+        session_id: command.layer === "working" ? currentSessionId : null,
+        source_session_id: currentSessionId,
+        source_text: `${command.name} ${command.content}`,
+      }),
+    });
+    hideCommandMenu();
+    const [session, updatedSessions, memory] = await Promise.all([
+      api(`/api/chat/sessions/${currentSessionId}`),
+      api("/api/chat/sessions"),
+      api(`/api/memory?session_id=${encodeURIComponent(currentSessionId)}`),
+    ]);
+    sessions = updatedSessions;
+    memorySnapshot = memory;
+    title.textContent = session.title;
+    renderSessions();
+    renderMessages(session.messages);
+    status.textContent = command.layer === "working"
+      ? `Сохранено в рабочую память: ${command.category}`
+      : `Сохранено в долговременную память: ${command.category}`;
+  } catch (error) {
+    status.textContent = error.message;
+  } finally {
+    setBusy(false);
+    input.focus();
+    void drainQueue();
+  }
 }
 
 function renderSessions() {
@@ -47,29 +211,132 @@ function renderSessions() {
   }));
 }
 
-function renderMessages(items) {
+function renderMessages(items, updateState = true) {
+  if (updateState) {
+    currentMessages = items;
+    renderMemory();
+  }
   if (!items.length) {
     messages.innerHTML = '<div class="empty"><span>✦</span><h2>Чем помочь?</h2><p>Каждая сессия имеет собственную историю диалога.</p></div>';
     return;
   }
   messages.replaceChildren(...items.map((message) => {
     const article = document.createElement("article");
-    article.className = `message ${message.role}`;
+    const kind = message.kind || "message";
+    article.className = `message ${message.role} ${kind}`;
     const label = document.createElement("span");
-    label.textContent = message.role === "user" ? "Вы" : "Агент";
-    const content = document.createElement("p");
-    content.textContent = message.content;
+    label.textContent = kind === "command"
+      ? "Команда памяти"
+      : (message.role === "user" ? "Вы" : "Агент");
+    let content;
+    if (kind === "pending") {
+      content = document.createElement("div");
+      content.className = "typing-indicator";
+      content.setAttribute("aria-label", "Агент формирует ответ");
+      content.append(
+        document.createElement("i"),
+        document.createElement("i"),
+        document.createElement("i"),
+      );
+    } else {
+      content = document.createElement("p");
+      content.textContent = message.content;
+    }
     article.append(label, content);
     return article;
   }));
   messages.scrollTop = messages.scrollHeight;
 }
 
+function emptyMemory(text) {
+  const item = document.createElement("p");
+  item.className = "memory-empty";
+  item.textContent = text;
+  return item;
+}
+
+function renderShortTermMemory() {
+  const shortTermMessages = currentMessages.filter((message) => (
+    (message.kind || "message") === "message"
+  ));
+  shortTermCount.textContent = String(shortTermMessages.length);
+  const recent = shortTermMessages.slice(-6);
+  if (!recent.length) {
+    shortTermMemory.replaceChildren(emptyMemory("Диалог пока пуст."));
+    return;
+  }
+  shortTermMemory.replaceChildren(...recent.map((message) => {
+    const item = document.createElement("article");
+    item.className = "memory-item compact";
+    const category = document.createElement("strong");
+    category.textContent = message.role === "user" ? "user" : "assistant";
+    const content = document.createElement("p");
+    content.textContent = message.content;
+    item.append(category, content);
+    return item;
+  }));
+}
+
+function memoryEntryElement(entry) {
+  const item = document.createElement("article");
+  item.className = "memory-item";
+  const heading = document.createElement("div");
+  const category = document.createElement("strong");
+  category.textContent = entry.category;
+  const remove = document.createElement("button");
+  remove.type = "button";
+  remove.className = "memory-delete";
+  remove.title = "Удалить запись";
+  remove.setAttribute("aria-label", `Удалить ${entry.category}`);
+  remove.textContent = "×";
+  remove.addEventListener("click", () => deleteMemory(entry));
+  heading.append(category, remove);
+  const content = document.createElement("p");
+  content.textContent = entry.content;
+  item.append(heading, content);
+  return item;
+}
+
+function renderMemoryList(container, entries, emptyText) {
+  if (!entries.length) {
+    container.replaceChildren(emptyMemory(emptyText));
+    return;
+  }
+  container.replaceChildren(...entries.map(memoryEntryElement));
+}
+
+function renderMemory() {
+  renderShortTermMemory();
+  workingCount.textContent = String(memorySnapshot.working.length);
+  longTermCount.textContent = String(memorySnapshot.long_term.length);
+  renderMemoryList(workingMemory, memorySnapshot.working, "Нет данных задачи.");
+  renderMemoryList(longTermMemory, memorySnapshot.long_term, "Нет общих воспоминаний.");
+}
+
+async function loadMemory(sessionId) {
+  memorySnapshot = await api(`/api/memory?session_id=${encodeURIComponent(sessionId)}`);
+  renderMemory();
+}
+
+async function deleteMemory(entry) {
+  try {
+    await api(`/api/memory/${entry.layer}/${entry.id}`, { method: "DELETE" });
+    await loadMemory(currentSessionId);
+    status.textContent = "Запись памяти удалена";
+  } catch (error) {
+    status.textContent = error.message;
+  }
+}
+
 async function openSession(sessionId) {
   if (busy) return;
   try {
-    const session = await api(`/api/chat/sessions/${sessionId}`);
+    const [session, memory] = await Promise.all([
+      api(`/api/chat/sessions/${sessionId}`),
+      api(`/api/memory?session_id=${encodeURIComponent(sessionId)}`),
+    ]);
     currentSessionId = session.id;
+    memorySnapshot = memory;
     title.textContent = session.title;
     renderSessions();
     renderMessages(session.messages);
@@ -78,6 +345,52 @@ async function openSession(sessionId) {
   } catch (error) {
     status.textContent = error.message;
   }
+}
+
+async function sendChatMessage(content) {
+  setBusy(true);
+  const optimisticMessages = [
+    ...currentMessages,
+    { role: "user", kind: "message", content },
+    { role: "assistant", kind: "pending", content: "" },
+  ];
+  renderMessages(optimisticMessages, false);
+  try {
+    const result = await api(`/api/chat/sessions/${currentSessionId}/messages`, {
+      method: "POST",
+      body: JSON.stringify({ content }),
+    });
+    const session = await api(`/api/chat/sessions/${currentSessionId}`);
+    sessions = sessions.filter((item) => item.id !== result.session.id);
+    sessions.unshift(result.session);
+    title.textContent = result.session.title;
+    renderSessions();
+    renderMessages(session.messages);
+    status.textContent = "Готов";
+  } catch (error) {
+    renderMessages(currentMessages);
+    status.textContent = error.message;
+  } finally {
+    setBusy(false);
+    input.focus();
+    void drainQueue();
+  }
+}
+
+async function dispatchContent(content) {
+  const memoryCommand = parsedMemoryCommand(content);
+  if (memoryCommand) {
+    await executeMemoryCommand(memoryCommand);
+  } else {
+    await sendChatMessage(content);
+  }
+}
+
+async function drainQueue() {
+  if (busy || !queuedMessages.length || !currentSessionId) return;
+  const [next] = queuedMessages.splice(0, 1);
+  renderQueue();
+  await dispatchContent(next.content);
 }
 
 async function createSession() {
@@ -104,31 +417,61 @@ async function loadSessions() {
 form.addEventListener("submit", async (event) => {
   event.preventDefault();
   const content = input.value.trim();
-  if (!content || !currentSessionId || busy) return;
-  setBusy(true);
-  try {
-    const result = await api(`/api/chat/sessions/${currentSessionId}/messages`, {
-      method: "POST",
-      body: JSON.stringify({ content }),
-    });
-    input.value = "";
-    const session = await api(`/api/chat/sessions/${currentSessionId}`);
-    sessions = sessions.filter((item) => item.id !== result.session.id);
-    sessions.unshift(result.session);
-    title.textContent = result.session.title;
-    renderSessions();
-    renderMessages(session.messages);
-    status.textContent = "Готов";
-  } catch (error) {
-    status.textContent = error.message;
-  } finally {
-    setBusy(false);
+  if (!content || !currentSessionId) return;
+  const memoryCommand = parsedMemoryCommand(content);
+  if (memoryCommand && !memoryCommand.content) {
+    await executeMemoryCommand(memoryCommand);
+    return;
   }
+  input.value = "";
+  hideCommandMenu();
+  if (busy) {
+    enqueueMessage(content);
+    input.focus();
+    return;
+  }
+  await dispatchContent(content);
+});
+
+input.addEventListener("keydown", (event) => {
+  const matches = commandMatches();
+  if (!commandMenu.hidden && matches.length) {
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      const direction = event.key === "ArrowDown" ? 1 : -1;
+      activeCommandIndex = (activeCommandIndex + direction + matches.length) % matches.length;
+      renderCommandMenu();
+      return;
+    }
+    if (event.key === "Tab" || event.key === "Enter") {
+      event.preventDefault();
+      selectCommand(matches[activeCommandIndex]);
+      return;
+    }
+    if (event.key === "Escape") {
+      event.preventDefault();
+      hideCommandMenu();
+      return;
+    }
+  }
+  if (
+    event.key === "Enter"
+    && !event.shiftKey
+    && !event.isComposing
+  ) {
+    event.preventDefault();
+    if (input.value.trim()) form.requestSubmit();
+  }
+});
+
+input.addEventListener("input", () => {
+  activeCommandIndex = 0;
+  renderCommandMenu();
 });
 
 newButton.addEventListener("click", createSession);
 clearDatabaseButton.addEventListener("click", async () => {
-  if (busy || !window.confirm("Удалить все чат-сессии и сообщения без возможности восстановления?")) return;
+  if (busy || !window.confirm("Удалить все чаты, сообщения и их рабочую память? Долговременная память сохранится.")) return;
 
   setBusy(true);
   try {
@@ -148,4 +491,6 @@ clearDatabaseButton.addEventListener("click", async () => {
   await createSession();
 });
 
+renderMemory();
+renderQueue();
 loadSessions();
