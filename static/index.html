@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="description" content="Изолированный чат с агентом" />
+    <meta name="description" content="Чат с агентом и явной моделью памяти" />
     <title>Rubik Agent Chat</title>
     <link rel="icon" href="data:," />
     <link rel="stylesheet" href="/styles.css" />
@@ -16,7 +16,7 @@
         <nav id="sessions" aria-label="Сессии чата"></nav>
         <button id="clear-database" class="danger" type="button">Очистить историю</button>
 
-        <p class="memory-note">Агент видит только сообщения текущего чата и не имеет доступа к коду или окружению.</p>
+        <p class="memory-note">Контекст собирается из трёх явных слоёв. Агент не имеет доступа к коду или окружению.</p>
       </aside>
 
       <section class="conversation" aria-labelledby="chat-title">
@@ -36,18 +36,73 @@
           </div>
         </div>
 
+        <section id="followup-queue" class="followup-queue" aria-label="Очередь сообщений" aria-live="polite" hidden>
+          <header>
+            <strong>Далее</strong>
+            <span id="queue-count">0</span>
+          </header>
+          <div id="queued-messages"></div>
+        </section>
+
         <form id="message-form">
           <textarea
             id="message-input"
             rows="2"
             maxlength="12000"
-            placeholder="Напишите сообщение…"
+            placeholder="Сообщение или /команда…"
             aria-label="Сообщение агенту"
+            aria-controls="command-menu"
+            aria-autocomplete="list"
             required
           ></textarea>
+          <div id="command-menu" class="command-menu" role="listbox" aria-label="Команды памяти" hidden></div>
           <button class="primary" type="submit">Отправить</button>
         </form>
       </section>
+
+      <aside class="memory-panel" aria-labelledby="memory-title">
+        <header>
+          <div>
+            <p class="eyebrow">MEMORY INSPECTOR</p>
+            <h2 id="memory-title">Память агента</h2>
+          </div>
+          <span class="explicit-badge">explicit</span>
+        </header>
+
+        <div class="memory-layers">
+          <section class="memory-layer short-term">
+            <div class="layer-heading">
+              <div><span class="layer-dot"></span><strong>Краткосрочная</strong></div>
+              <span id="short-term-count" class="layer-count">0</span>
+            </div>
+            <p class="layer-description">Последние сообщения только этого чата.</p>
+            <div id="short-term-memory" class="memory-items"></div>
+          </section>
+
+          <section class="memory-layer working">
+            <div class="layer-heading">
+              <div><span class="layer-dot"></span><strong>Рабочая</strong></div>
+              <span id="working-count" class="layer-count">0</span>
+            </div>
+            <p class="layer-description">Цель, ограничения и решения текущей задачи.</p>
+            <div id="working-memory" class="memory-items"></div>
+          </section>
+
+          <section class="memory-layer long-term">
+            <div class="layer-heading">
+              <div><span class="layer-dot"></span><strong>Долговременная</strong></div>
+              <span id="long-term-count" class="layer-count">0</span>
+            </div>
+            <p class="layer-description">Профиль и знания, общие для всех чатов.</p>
+            <div id="long-term-memory" class="memory-items"></div>
+          </section>
+        </div>
+
+        <section class="command-help">
+          <strong>Slash-команды</strong>
+          <p>Введи <kbd>/</kbd> в поле сообщения. Working-команды действуют только в этом чате, long-term — во всех.</p>
+        </section>
+      </aside>
     </main>
     <script src="/app.js" defer></script>
   </body>

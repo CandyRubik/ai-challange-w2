@@ -11,6 +11,7 @@ from uuid import uuid4
 
 from ..agents.agent import Agent, AgentMessage
 from ..schemas import ChatMessage, ChatSendResponse, ChatSession, ChatSessionSummary
+from .memory import MemoryRepository
 
 
 DEFAULT_CHAT_DB_PATH = Path(__file__).resolve().parents[2] / "data" / "chat.sqlite3"
@@ -25,6 +26,7 @@ class ChatSessionNotFound(LookupError):
 class StoredMessage:
     id: str
     role: str
+    kind: str
     content: str
     created_at: datetime
 
@@ -53,6 +55,8 @@ class ChatSessionRepository(Protocol):
         user_content: str,
         assistant_content: str,
     ) -> StoredSession: ...
+
+    def append_command(self, session_id: str, command_text: str) -> StoredSession: ...
 
 
 class SQLiteChatSessionRepository:
@@ -97,6 +101,8 @@ class SQLiteChatSessionRepository:
                     session_id TEXT NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
                     position INTEGER NOT NULL,
                     role TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
+                    kind TEXT NOT NULL DEFAULT 'message'
+                        CHECK (kind IN ('message', 'command')),
                     content TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     UNIQUE (session_id, position)
@@ -106,6 +112,18 @@ class SQLiteChatSessionRepository:
                 ON chat_messages(session_id, position);
                 """,
             )
+            columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(chat_messages)")
+            }
+            if "kind" not in columns:
+                connection.execute(
+                    """
+                    ALTER TABLE chat_messages
+                    ADD COLUMN kind TEXT NOT NULL DEFAULT 'message'
+                        CHECK (kind IN ('message', 'command'))
+                    """,
+                )
 
     @staticmethod
     def _timestamp(value: datetime) -> str:
@@ -129,7 +147,7 @@ class SQLiteChatSessionRepository:
 
         message_rows = connection.execute(
             """
-            SELECT id, role, content, created_at
+            SELECT id, role, kind, content, created_at
             FROM chat_messages
             WHERE session_id = ?
             ORDER BY position
@@ -140,6 +158,7 @@ class SQLiteChatSessionRepository:
             StoredMessage(
                 id=message["id"],
                 role=message["role"],
+                kind=message["kind"],
                 content=message["content"],
                 created_at=self._datetime(message["created_at"]),
             )
@@ -204,13 +223,16 @@ class SQLiteChatSessionRepository:
             connection.executemany(
                 """
                 INSERT INTO chat_messages
-                    (id, session_id, position, role, content, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                    (id, session_id, position, role, kind, content, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
-                    (str(uuid4()), session_id, position, "user", user_content, timestamp),
                     (
-                        str(uuid4()), session_id, position + 1, "assistant",
+                        str(uuid4()), session_id, position, "user", "message",
+                        user_content, timestamp,
+                    ),
+                    (
+                        str(uuid4()), session_id, position + 1, "assistant", "message",
                         assistant_content, timestamp,
                     ),
                 ],
@@ -222,13 +244,46 @@ class SQLiteChatSessionRepository:
 
         return self.get(session_id)
 
+    def append_command(self, session_id: str, command_text: str) -> StoredSession:
+        now = datetime.now(timezone.utc)
+        timestamp = self._timestamp(now)
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            session = self._load_session(connection, session_id)
+            position = len(session.messages)
+            title = session.title
+            if not session.messages:
+                title = command_text.replace("\n", " ").strip()[:60] or "Новый чат"
+            connection.execute(
+                """
+                INSERT INTO chat_messages
+                    (id, session_id, position, role, kind, content, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(uuid4()), session_id, position, "user", "command",
+                    command_text, timestamp,
+                ),
+            )
+            connection.execute(
+                "UPDATE chat_sessions SET title = ?, updated_at = ? WHERE id = ?",
+                (title, timestamp, session_id),
+            )
+        return self.get(session_id)
+
 
 class ChatSessionService:
     """Adapt persistent sessions to the storage-agnostic Agent."""
 
-    def __init__(self, repository: ChatSessionRepository, agent: Agent) -> None:
+    def __init__(
+        self,
+        repository: ChatSessionRepository,
+        agent: Agent,
+        memory_repository: MemoryRepository | None = None,
+    ) -> None:
         self._repository = repository
         self._agent = agent
+        self._memory_repository = memory_repository
 
     @staticmethod
     def _summary(session: StoredSession) -> ChatSessionSummary:
@@ -244,6 +299,7 @@ class ChatSessionService:
         return ChatMessage(
             id=message.id,
             role=message.role,
+            kind=message.kind,
             content=message.content,
             created_at=message.created_at,
         )
@@ -270,8 +326,25 @@ class ChatSessionService:
         context: list[AgentMessage] = [
             {"role": message.role, "content": message.content}
             for message in session.messages
+            if message.kind == "message"
         ]
-        answer = self._agent.respond(context, content)
+        working_memory = []
+        long_term_memory = []
+        if self._memory_repository is not None:
+            working_memory = [
+                {"category": memory.category, "content": memory.content}
+                for memory in self._memory_repository.list_working(session_id)
+            ]
+            long_term_memory = [
+                {"category": memory.category, "content": memory.content}
+                for memory in self._memory_repository.list_long_term()
+            ]
+        answer = self._agent.respond(
+            context,
+            content,
+            working_memory=working_memory,
+            long_term_memory=long_term_memory,
+        )
         updated = self._repository.append_exchange(session_id, content.strip(), answer)
         return ChatSendResponse(
             session=self._summary(updated),

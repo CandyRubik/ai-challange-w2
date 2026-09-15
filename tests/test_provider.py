@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.providers.deepseek import DeepSeekProvider, LlmRequestError
+from app.providers.deepseek import CONTINUATION_PROMPT, DeepSeekProvider, LlmRequestError
 
 
 class FakeCompletions:
@@ -81,6 +81,29 @@ def test_provider_forwards_agent_context() -> None:
 
     assert provider.generate(messages=messages) == "Новый ответ"
     assert completions.requests[0]["messages"] == messages
+
+
+def test_provider_continues_an_answer_cut_by_token_limit() -> None:
+    completions = FakeCompletions(
+        completion("Первая часть оборвалась на полуслове вер", finish_reason="length"),
+        completion("оятностей. Вторая часть завершена."),
+    )
+    provider = DeepSeekProvider(client=client(completions))  # type: ignore[arg-type]
+
+    answer = provider.generate(messages=[{"role": "user", "content": "Длинный ответ"}])
+
+    assert answer == (
+        "Первая часть оборвалась на полуслове вероятностей. "
+        "Вторая часть завершена."
+    )
+    assert len(completions.requests) == 2
+    assert completions.requests[1]["messages"][-2:] == [
+        {
+            "role": "assistant",
+            "content": "Первая часть оборвалась на полуслове вер",
+        },
+        {"role": "user", "content": CONTINUATION_PROMPT},
+    ]
 
 
 def test_agent_provider_can_disable_thinking() -> None:
