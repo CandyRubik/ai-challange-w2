@@ -1,2 +1,1 @@
-"""Rubik Study Harness backend."""
-
+"""Rubik Agent Chat backend."""

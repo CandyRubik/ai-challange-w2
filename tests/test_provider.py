@@ -22,14 +22,6 @@ class FakeCompletions:
 
 def completion(content: str, finish_reason: str = "stop") -> SimpleNamespace:
     return SimpleNamespace(
-        model="deepseek-v4-flash",
-        usage=SimpleNamespace(
-            prompt_tokens=120,
-            completion_tokens=12,
-            prompt_cache_hit_tokens=80,
-            prompt_cache_miss_tokens=40,
-            completion_tokens_details=SimpleNamespace(reasoning_tokens=5),
-        ),
         choices=[
             SimpleNamespace(
                 finish_reason=finish_reason,
@@ -44,11 +36,8 @@ def stream_chunk(
     reasoning: str = "",
     content: str = "",
     finish_reason: str | None = None,
-    usage: SimpleNamespace | None = None,
 ) -> SimpleNamespace:
     return SimpleNamespace(
-        model="deepseek-v4-flash",
-        usage=usage,
         choices=[
             SimpleNamespace(
                 finish_reason=finish_reason,
@@ -69,13 +58,7 @@ def test_provider_uses_chat_defaults() -> None:
     completions = FakeCompletions(completion("Готово"))
     provider = DeepSeekProvider(client=client(completions))  # type: ignore[arg-type]
 
-    result = provider.generate(messages=[{"role": "user", "content": "Вопрос"}])
-
-    assert result.content == "Готово"
-    assert result.usage.prompt_tokens == 120
-    assert result.usage.completion_tokens == 12
-    assert result.usage.cache_hit_tokens == 80
-    assert result.usage.reasoning_tokens == 5
+    assert provider.generate(messages=[{"role": "user", "content": "Вопрос"}]) == "Готово"
     assert completions.requests == [{
         "model": "deepseek-v4-flash",
         "messages": [{"role": "user", "content": "Вопрос"}],
@@ -96,7 +79,7 @@ def test_provider_forwards_agent_context() -> None:
         {"role": "user", "content": "Продолжение"},
     ]
 
-    assert provider.generate(messages=messages).content == "Новый ответ"
+    assert provider.generate(messages=messages) == "Новый ответ"
     assert completions.requests[0]["messages"] == messages
 
 
@@ -124,10 +107,7 @@ def test_provider_retries_empty_response_without_thinking() -> None:
     )
     provider = DeepSeekProvider(client=client(completions))  # type: ignore[arg-type]
 
-    result = provider.generate(messages=[{"role": "user", "content": "Вопрос"}])
-
-    assert result.content == "Ответ после повтора"
-    assert result.usage.prompt_tokens == 240
+    assert provider.generate(messages=[{"role": "user", "content": "Вопрос"}]) == "Ответ после повтора"
     assert len(completions.requests) == 2
     assert completions.requests[1]["extra_body"] == {
         "thinking": {"type": "disabled"},
@@ -143,39 +123,6 @@ def test_provider_does_not_retry_content_filtered_response() -> None:
         provider.generate(messages=[{"role": "user", "content": "Вопрос"}])
 
     assert len(completions.requests) == 1
-
-
-def test_provider_preserves_context_overflow_details() -> None:
-    error = RuntimeError("bad request")
-    error.status_code = 400  # type: ignore[attr-defined]
-    error.body = {  # type: ignore[attr-defined]
-        "error": {
-            "type": "invalid_request_error",
-            "message": "Maximum context length is 1000000 tokens",
-        }
-    }
-    provider = DeepSeekProvider(
-        client=client(FakeCompletions(error)),  # type: ignore[arg-type]
-        thinking_enabled=False,
-    )
-
-    with pytest.raises(LlmRequestError) as raised:
-        list(provider.generate_stream(messages=[{"role": "user", "content": "x"}]))
-
-    assert raised.value.status_code == 400
-    assert raised.value.provider_code == "invalid_request_error"
-    assert raised.value.is_context_overflow is True
-
-
-def test_unrelated_bad_request_is_not_treated_as_context_overflow() -> None:
-    error = LlmRequestError(
-        "bad request",
-        status_code=400,
-        provider_code="invalid_request_error",
-        provider_message="Invalid max_tokens value",
-    )
-
-    assert error.is_context_overflow is False
 
 
 def test_provider_streams_reasoning_and_content() -> None:
@@ -198,46 +145,6 @@ def test_provider_streams_reasoning_and_content() -> None:
         "Итоговый ответ.",
     ]
     assert completions.requests[0]["stream"] is True
-    assert completions.requests[0]["stream_options"] == {"include_usage": True}
-
-
-def test_provider_streams_context_and_final_usage() -> None:
-    final_usage = SimpleNamespace(
-        prompt_tokens=42,
-        completion_tokens=7,
-        prompt_cache_hit_tokens=32,
-        prompt_cache_miss_tokens=10,
-        completion_tokens_details=SimpleNamespace(reasoning_tokens=0),
-    )
-    completions = FakeCompletions(
-        iter(
-            [
-                stream_chunk(content="Часть "),
-                stream_chunk(content="ответа", finish_reason="stop", usage=final_usage),
-            ]
-        )
-    )
-    provider = DeepSeekProvider(
-        client=client(completions),  # type: ignore[arg-type]
-        thinking_enabled=False,
-    )
-    messages = [
-        {"role": "system", "content": "system"},
-        {"role": "user", "content": "first"},
-        {"role": "assistant", "content": "answer"},
-        {"role": "user", "content": "next"},
-    ]
-
-    chunks = list(provider.generate_stream(messages=messages, max_tokens=64))
-
-    assert "".join(chunk.content for chunk in chunks) == "Часть ответа"
-    assert chunks[-1].usage is not None
-    assert chunks[-1].usage.prompt_tokens == 42
-    assert chunks[-1].finish_reason == "stop"
-    assert completions.requests[0]["messages"] == messages
-    assert completions.requests[0]["extra_body"] == {
-        "thinking": {"type": "disabled"},
-    }
 
 
 def test_provider_retries_empty_stream_without_thinking() -> None:

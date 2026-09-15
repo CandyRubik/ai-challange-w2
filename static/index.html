@@ -3,94 +3,48 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="description" content="Лаборатория токенов для чат-агента" />
-    <title>Rubik Study Harness — Token Lab</title>
+    <meta name="description" content="Изолированный чат с агентом" />
+    <title>Rubik Agent Chat</title>
     <link rel="icon" href="data:," />
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
-    <main class="shell">
+    <main class="chat-shell">
       <aside class="sidebar">
-        <a class="brand" href="/"><span>◇</span> Rubik Study Harness</a>
+        <a class="brand" href="/"><span>◇</span> Rubik Agent Chat</a>
         <button id="new-session" class="primary" type="button">＋ Новый чат</button>
-        <a class="benchmark-link" href="/benchmark.html">↗ Открыть Token Benchmark</a>
         <nav id="sessions" aria-label="Сессии чата"></nav>
-
-        <details class="settings">
-          <summary>⚙ Настройки модели</summary>
-          <form id="settings-form">
-            <label>Модель
-              <input name="model" list="model-options" required />
-              <datalist id="model-options">
-                <option value="deepseek-v4-flash"></option>
-                <option value="deepseek-v4-pro"></option>
-              </datalist>
-            </label>
-            <label class="check"><input name="thinking_enabled" type="checkbox" /> Thinking</label>
-            <label class="check"><input name="history_enabled" type="checkbox" /> Передавать историю</label>
-            <label>Резерв ответа
-              <input name="max_tokens" type="number" min="16" max="384000" />
-            </label>
-            <label>Лимит контекста
-              <input name="context_limit_tokens" type="number" min="256" max="1000000" />
-            </label>
-            <label>При переполнении
-              <select name="overflow_strategy">
-                <option value="reject">Остановить запрос</option>
-                <option value="trim">Удалять старые ходы</option>
-              </select>
-            </label>
-            <label>System prompt
-              <textarea name="system_prompt" rows="4" maxlength="4000"></textarea>
-            </label>
-            <div class="settings-actions">
-              <button class="primary" type="submit">Применить</button>
-              <button id="reset-settings" type="button">Сбросить</button>
-            </div>
-          </form>
-        </details>
         <button id="clear-database" class="danger" type="button">Очистить историю</button>
+
+        <p class="memory-note">Агент видит только сообщения текущего чата и не имеет доступа к коду или окружению.</p>
       </aside>
 
-      <section class="workspace" aria-labelledby="chat-title">
+      <section class="conversation" aria-labelledby="chat-title">
         <header>
           <div>
-            <p class="eyebrow">ДЕНЬ 8 · TOKEN LAB</p>
+            <p class="eyebrow">CODE-ISOLATED AGENT CHAT</p>
             <h1 id="chat-title">Новый чат</h1>
           </div>
           <span id="status" role="status">Подключение…</span>
         </header>
 
-        <section class="dashboard" aria-label="Метрики токенов">
-          <div class="dashboard-heading">
-            <div><p class="eyebrow">ТЕКУЩИЙ ХОД</p><h2>Как растёт контекст</h2></div>
-            <span>локальная оценка + фактический API usage</span>
-          </div>
-          <div class="metrics">
-            <article><span>Текущий запрос</span><strong id="metric-current">0</strong><small>локально</small></article>
-            <article><span>Вся история</span><strong id="metric-history">0</strong><small>до запроса</small></article>
-            <article><span>Вход модели</span><strong id="metric-prompt">0</strong><small>API</small></article>
-            <article><span>Ответ модели</span><strong id="metric-completion">0</strong><small>API</small></article>
-            <article><span>За сессию</span><strong id="metric-total">0</strong><small>input + output</small></article>
-            <article><span>Стоимость</span><strong id="metric-cost">$0.000000</strong><small>оценка</small></article>
-          </div>
-          <div class="meter"><i id="context-fill"></i></div>
-          <p id="context-caption" class="caption">Контекст ещё не использован</p>
-          <article id="overflow-event" class="overflow-event" hidden>
-            <strong>Отклонённый запрос · не отправлен в API</strong>
-            <p id="overflow-request"></p>
-            <small id="overflow-metrics"></small>
-          </article>
-          <div id="turn-chart" class="turn-chart"></div>
-
-        </section>
-
         <div id="messages" class="messages" aria-live="polite">
-          <div class="empty"><span>✦</span><h2>Начните диалог</h2><p>У каждого сообщения появится его расход токенов.</p></div>
+          <div class="empty">
+            <span>✦</span>
+            <h2>Чем помочь?</h2>
+            <p>Каждая сессия имеет собственную историю диалога.</p>
+          </div>
         </div>
 
-        <form id="message-form" class="composer">
-          <textarea id="message-input" rows="2" maxlength="8000000" placeholder="Напишите сообщение…" aria-label="Сообщение агенту" required></textarea>
+        <form id="message-form">
+          <textarea
+            id="message-input"
+            rows="2"
+            maxlength="12000"
+            placeholder="Напишите сообщение…"
+            aria-label="Сообщение агенту"
+            required
+          ></textarea>
           <button class="primary" type="submit">Отправить</button>
         </form>
       </section>

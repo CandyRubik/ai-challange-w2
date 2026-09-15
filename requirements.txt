@@ -1,5 +1,4 @@
 fastapi>=0.115,<1
 openai>=1.60,<2
 pydantic>=2.10,<3
-tokenizers>=0.21,<1
 uvicorn[standard]>=0.34,<1

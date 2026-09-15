@@ -2,24 +2,15 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import datetime, timezone
-import json
 from pathlib import Path
 import sqlite3
 from typing import Protocol
 from uuid import uuid4
 
 from ..agents.agent import Agent, AgentMessage
-from ..schemas import (
-    ChatMessage,
-    ChatSendResponse,
-    ChatSession,
-    ChatSessionSummary,
-    ChatSessionTokenUsage,
-    ChatTurnTokenUsage,
-)
-from ..token_usage import AgentTokenMetrics
+from ..schemas import ChatMessage, ChatSendResponse, ChatSession, ChatSessionSummary
 
 
 DEFAULT_CHAT_DB_PATH = Path(__file__).resolve().parents[2] / "data" / "chat.sqlite3"
@@ -45,7 +36,6 @@ class StoredSession:
     created_at: datetime
     updated_at: datetime
     messages: tuple[StoredMessage, ...] = ()
-    token_metrics: tuple[AgentTokenMetrics, ...] = ()
 
 
 class ChatSessionRepository(Protocol):
@@ -62,7 +52,6 @@ class ChatSessionRepository(Protocol):
         session_id: str,
         user_content: str,
         assistant_content: str,
-        token_metrics: AgentTokenMetrics,
     ) -> StoredSession: ...
 
 
@@ -115,13 +104,6 @@ class SQLiteChatSessionRepository:
 
                 CREATE INDEX IF NOT EXISTS idx_chat_messages_session
                 ON chat_messages(session_id, position);
-
-                CREATE TABLE IF NOT EXISTS chat_turn_usage (
-                    session_id TEXT NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
-                    turn INTEGER NOT NULL,
-                    payload TEXT NOT NULL,
-                    PRIMARY KEY (session_id, turn)
-                );
                 """,
             )
 
@@ -163,25 +145,12 @@ class SQLiteChatSessionRepository:
             )
             for message in message_rows
         )
-        usage_rows = connection.execute(
-            """
-            SELECT payload
-            FROM chat_turn_usage
-            WHERE session_id = ?
-            ORDER BY turn
-            """,
-            (session_id,),
-        ).fetchall()
-        token_metrics = tuple(
-            AgentTokenMetrics(**json.loads(usage["payload"])) for usage in usage_rows
-        )
         return StoredSession(
             id=row["id"],
             title=row["title"],
             created_at=self._datetime(row["created_at"]),
             updated_at=self._datetime(row["updated_at"]),
             messages=messages,
-            token_metrics=token_metrics,
         )
 
     def create(self) -> StoredSession:
@@ -221,7 +190,6 @@ class SQLiteChatSessionRepository:
         session_id: str,
         user_content: str,
         assistant_content: str,
-        token_metrics: AgentTokenMetrics,
     ) -> StoredSession:
         now = datetime.now(timezone.utc)
         timestamp = self._timestamp(now)
@@ -246,17 +214,6 @@ class SQLiteChatSessionRepository:
                         assistant_content, timestamp,
                     ),
                 ],
-            )
-            connection.execute(
-                """
-                INSERT INTO chat_turn_usage (session_id, turn, payload)
-                VALUES (?, ?, ?)
-                """,
-                (
-                    session_id,
-                    len(session.token_metrics) + 1,
-                    json.dumps(asdict(token_metrics), ensure_ascii=False),
-                ),
             )
             connection.execute(
                 "UPDATE chat_sessions SET title = ?, updated_at = ? WHERE id = ?",
@@ -291,33 +248,9 @@ class ChatSessionService:
             created_at=message.created_at,
         )
 
-    @staticmethod
-    def _turn_usage(metrics: AgentTokenMetrics, turn: int) -> ChatTurnTokenUsage:
-        return ChatTurnTokenUsage(turn=turn, **asdict(metrics))
-
-    @classmethod
-    def _token_usage(cls, session: StoredSession) -> ChatSessionTokenUsage:
-        turns = [
-            cls._turn_usage(metrics, turn)
-            for turn, metrics in enumerate(session.token_metrics, start=1)
-        ]
-        return ChatSessionTokenUsage(
-            turns=turns,
-            prompt_tokens=sum(turn.prompt_tokens for turn in turns),
-            completion_tokens=sum(turn.completion_tokens for turn in turns),
-            total_tokens=sum(turn.total_tokens for turn in turns),
-            estimated_cost_usd=sum(
-                turn.estimated_cost_usd or 0.0 for turn in turns
-            ),
-        )
-
     def create(self) -> ChatSession:
         session = self._repository.create()
-        return ChatSession(
-            **self._summary(session).model_dump(),
-            messages=[],
-            token_usage=ChatSessionTokenUsage(),
-        )
+        return ChatSession(**self._summary(session).model_dump(), messages=[])
 
     def list(self) -> list[ChatSessionSummary]:
         return [self._summary(session) for session in self._repository.list()]
@@ -327,7 +260,6 @@ class ChatSessionService:
         return ChatSession(
             **self._summary(session).model_dump(),
             messages=[self._message(message) for message in session.messages],
-            token_usage=self._token_usage(session),
         )
 
     def clear(self) -> None:
@@ -339,16 +271,10 @@ class ChatSessionService:
             {"role": message.role, "content": message.content}
             for message in session.messages
         ]
-        result = self._agent.respond(context, content)
-        updated = self._repository.append_exchange(
-            session_id,
-            content.strip(),
-            result.content,
-            result.metrics,
-        )
+        answer = self._agent.respond(context, content)
+        updated = self._repository.append_exchange(session_id, content.strip(), answer)
         return ChatSendResponse(
             session=self._summary(updated),
             user_message=self._message(updated.messages[-2]),
             assistant_message=self._message(updated.messages[-1]),
-            token_usage=self._turn_usage(result.metrics, len(updated.token_metrics)),
         )

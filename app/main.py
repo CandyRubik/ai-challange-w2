@@ -1,49 +1,26 @@
 from __future__ import annotations
 
 from functools import lru_cache
-import json
-import logging
 import os
 from pathlib import Path
-from threading import RLock
 
 from fastapi import Depends, FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from .agents.agent import (
-    Agent,
-    AgentContextOverflow,
-    AgentInputError,
-    AgentOutputError,
-)
+from .agents.agent import Agent, AgentInputError, AgentOutputError
 from .providers.deepseek import (
     DeepSeekProvider,
     LlmConfigurationError,
     LlmRequestError,
 )
-from .schemas import (
-    ChatExperimentSettings,
-    ChatSendRequest,
-    ChatSendResponse,
-    ChatSession,
-    ChatSessionSummary,
-    TokenBenchmarkPlan,
-    TokenBenchmarkReport,
-)
+from .schemas import ChatSendRequest, ChatSendResponse, ChatSession, ChatSessionSummary
 from .services.chat_sessions import (
     ChatSessionNotFound,
     ChatSessionService,
     DEFAULT_CHAT_DB_PATH,
     SQLiteChatSessionRepository,
 )
-from .services.experiment_settings import ExperimentSettingsStore
-from .services.token_benchmark import TokenBenchmarkService, benchmark_plan
-from .tokenizer import DeepSeekTokenCounter, TokenizerSetupError
-
-
-logger = logging.getLogger(__name__)
 
 
 def _allowed_origins() -> list[str]:
@@ -53,20 +30,14 @@ def _allowed_origins() -> list[str]:
     return [origin.strip() for origin in configured_origins.split(",") if origin.strip()]
 
 
-app = FastAPI(title="Rubik Study Harness API")
+app = FastAPI(title="Rubik Agent Chat API")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_allowed_origins(),
     allow_credentials=False,
-    allow_methods=["DELETE", "GET", "POST", "PUT"],
+    allow_methods=["DELETE", "GET", "POST"],
     allow_headers=["Content-Type"],
 )
-
-_experiment_settings = ExperimentSettingsStore()
-_token_counter = DeepSeekTokenCounter()
-_benchmark_lock = RLock()
-_latest_benchmark_report: TokenBenchmarkReport | None = None
-
 
 @lru_cache(maxsize=1)
 def get_chat_repository() -> SQLiteChatSessionRepository:
@@ -75,19 +46,7 @@ def get_chat_repository() -> SQLiteChatSessionRepository:
 
 
 def get_chat_session_service() -> ChatSessionService:
-    settings = _experiment_settings.get()
-    agent = Agent(
-        DeepSeekProvider(
-            model=settings.model,
-            thinking_enabled=settings.thinking_enabled,
-        ),
-        _token_counter,
-        system_prompt=settings.system_prompt,
-        max_tokens=settings.max_tokens,
-        context_enabled=settings.history_enabled,
-        context_limit_tokens=settings.context_limit_tokens,
-        overflow_strategy=settings.overflow_strategy,
-    )
+    agent = Agent(DeepSeekProvider())
     return ChatSessionService(get_chat_repository(), agent)
 
 
@@ -97,73 +56,6 @@ def health() -> dict[str, bool | str]:
         "status": "ok",
         "deepseek_configured": bool(os.getenv("DEEPSEEK_API_KEY")),
     }
-
-
-@app.get("/api/debug/settings", response_model=ChatExperimentSettings)
-def get_debug_settings() -> ChatExperimentSettings:
-    return _experiment_settings.get()
-
-
-@app.put("/api/debug/settings", response_model=ChatExperimentSettings)
-def update_debug_settings(settings: ChatExperimentSettings) -> ChatExperimentSettings:
-    return _experiment_settings.replace(settings)
-
-
-@app.get("/api/benchmark/plan", response_model=TokenBenchmarkPlan)
-def get_benchmark_plan() -> TokenBenchmarkPlan:
-    return benchmark_plan()
-
-
-@app.post("/api/benchmark/run")
-def run_benchmark() -> StreamingResponse:
-    if not os.getenv("DEEPSEEK_API_KEY"):
-        raise HTTPException(status_code=503, detail="DEEPSEEK_API_KEY не задан")
-
-    settings = _experiment_settings.get()
-    service = TokenBenchmarkService(
-        DeepSeekProvider(model=settings.model, thinking_enabled=False),
-        _token_counter,
-        system_prompt=settings.system_prompt,
-    )
-
-    def event_lines():
-        global _latest_benchmark_report
-        try:
-            with _benchmark_lock:
-                for event in service.stream_events():
-                    if event["type"] == "benchmark_completed":
-                        _latest_benchmark_report = TokenBenchmarkReport.model_validate_json(
-                            json.dumps(event["report"], ensure_ascii=False)
-                        )
-                    yield json.dumps(event, ensure_ascii=False) + "\n"
-        except (AgentInputError, AgentOutputError, TokenizerSetupError) as error:
-            yield json.dumps(
-                {"type": "error", "message": str(error)},
-                ensure_ascii=False,
-            ) + "\n"
-        except (LlmConfigurationError, LlmRequestError):
-            logger.exception("Token benchmark failed")
-            yield json.dumps(
-                {"type": "error", "message": "Benchmark завершился ошибкой"},
-                ensure_ascii=False,
-            ) + "\n"
-
-    return StreamingResponse(
-        event_lines(),
-        media_type="application/x-ndjson",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-        },
-    )
-
-
-@app.get("/api/benchmark/latest", response_model=TokenBenchmarkReport)
-def get_latest_benchmark() -> TokenBenchmarkReport:
-    with _benchmark_lock:
-        if _latest_benchmark_report is None:
-            raise HTTPException(status_code=404, detail="Benchmark ещё не запускался")
-        return _latest_benchmark_report
 
 
 @app.post("/api/chat/sessions", response_model=ChatSession, status_code=201)
@@ -212,22 +104,9 @@ def send_chat_message(
         return service.send(session_id, request.content)
     except ChatSessionNotFound:
         raise HTTPException(status_code=404, detail="Чат не найден") from None
-    except AgentContextOverflow as error:
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "message": str(error),
-                "code": "context_overflow",
-                "prompt_tokens": error.prompt_tokens,
-                "reserved_output_tokens": error.reserved_output_tokens,
-                "context_limit_tokens": error.context_limit_tokens,
-                "overflow_tokens": error.overflow_tokens,
-            },
-        ) from None
-    except (AgentInputError, TokenizerSetupError) as error:
+    except AgentInputError as error:
         raise HTTPException(status_code=422, detail=str(error)) from None
     except (AgentOutputError, LlmRequestError):
-        logger.exception("Chat request failed")
         raise HTTPException(status_code=502, detail="Запрос к модели завершился ошибкой") from None
     except LlmConfigurationError:
         raise HTTPException(status_code=503, detail="DEEPSEEK_API_KEY не задан") from None
