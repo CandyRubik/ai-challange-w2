@@ -4,18 +4,28 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import logging
 from pathlib import Path
 import sqlite3
 from typing import Protocol
 from uuid import uuid4
 
-from ..agents.agent import Agent, AgentMessage
+from ..agents.agent import Agent, AgentMessage, ProfileContext
+from ..agents.memory_extractor import MemoryExtractionError, MemoryExtractor
+from ..agents.profile_interviewer import ProfileInterviewError, ProfileInterviewer
 from ..schemas import ChatMessage, ChatSendResponse, ChatSession, ChatSessionSummary
 from .memory import MemoryRepository
+from .profiles import (
+    DEFAULT_PROFILE_ID,
+    ProfileRepository,
+    StoredProfile,
+    ensure_profile_schema,
+)
 
 
 DEFAULT_CHAT_DB_PATH = Path(__file__).resolve().parents[2] / "data" / "chat.sqlite3"
 DEFAULT_DB_PATH = DEFAULT_CHAT_DB_PATH
+logger = logging.getLogger(__name__)
 
 
 class ChatSessionNotFound(LookupError):
@@ -34,6 +44,7 @@ class StoredMessage:
 @dataclass(frozen=True, slots=True)
 class StoredSession:
     id: str
+    profile_id: str
     title: str
     created_at: datetime
     updated_at: datetime
@@ -41,13 +52,13 @@ class StoredSession:
 
 
 class ChatSessionRepository(Protocol):
-    def create(self) -> StoredSession: ...
+    def create(self, profile_id: str = DEFAULT_PROFILE_ID) -> StoredSession: ...
 
-    def list(self) -> list[StoredSession]: ...
+    def list(self, profile_id: str | None = None) -> list[StoredSession]: ...
 
     def get(self, session_id: str) -> StoredSession: ...
 
-    def clear(self) -> None: ...
+    def clear(self, profile_id: str | None = None) -> None: ...
 
     def append_exchange(
         self,
@@ -87,10 +98,13 @@ class SQLiteChatSessionRepository:
 
     def _initialize(self) -> None:
         with self._connection() as connection:
+            ensure_profile_schema(connection)
             connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS chat_sessions (
                     id TEXT PRIMARY KEY,
+                    profile_id TEXT NOT NULL DEFAULT 'default'
+                        REFERENCES user_profiles(id),
                     title TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
@@ -112,11 +126,33 @@ class SQLiteChatSessionRepository:
                 ON chat_messages(session_id, position);
                 """,
             )
-            columns = {
+            session_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(chat_sessions)")
+            }
+            if "profile_id" not in session_columns:
+                connection.execute(
+                    """
+                    ALTER TABLE chat_sessions
+                    ADD COLUMN profile_id TEXT REFERENCES user_profiles(id)
+                    """,
+                )
+                connection.execute(
+                    "UPDATE chat_sessions SET profile_id = ? WHERE profile_id IS NULL",
+                    (DEFAULT_PROFILE_ID,),
+                )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_chat_sessions_profile
+                ON chat_sessions(profile_id, updated_at)
+                """,
+            )
+
+            message_columns = {
                 row["name"]
                 for row in connection.execute("PRAGMA table_info(chat_messages)")
             }
-            if "kind" not in columns:
+            if "kind" not in message_columns:
                 connection.execute(
                     """
                     ALTER TABLE chat_messages
@@ -139,7 +175,11 @@ class SQLiteChatSessionRepository:
         session_id: str,
     ) -> StoredSession:
         row = connection.execute(
-            "SELECT id, title, created_at, updated_at FROM chat_sessions WHERE id = ?",
+            """
+            SELECT id, profile_id, title, created_at, updated_at
+            FROM chat_sessions
+            WHERE id = ?
+            """,
             (session_id,),
         ).fetchone()
         if row is None:
@@ -166,43 +206,68 @@ class SQLiteChatSessionRepository:
         )
         return StoredSession(
             id=row["id"],
+            profile_id=row["profile_id"] or DEFAULT_PROFILE_ID,
             title=row["title"],
             created_at=self._datetime(row["created_at"]),
             updated_at=self._datetime(row["updated_at"]),
             messages=messages,
         )
 
-    def create(self) -> StoredSession:
+    def create(self, profile_id: str = DEFAULT_PROFILE_ID) -> StoredSession:
         session_id = str(uuid4())
         now = datetime.now(timezone.utc)
         with self._connection() as connection:
             connection.execute(
                 """
-                INSERT INTO chat_sessions (id, title, created_at, updated_at)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO chat_sessions
+                    (id, profile_id, title, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?)
                 """,
-                (session_id, "Новый чат", self._timestamp(now), self._timestamp(now)),
+                (
+                    session_id,
+                    profile_id,
+                    "Новый чат",
+                    self._timestamp(now),
+                    self._timestamp(now),
+                ),
             )
-        return StoredSession(session_id, "Новый чат", now, now)
+        return StoredSession(session_id, profile_id, "Новый чат", now, now)
 
-    def list(self) -> list[StoredSession]:
+    def list(self, profile_id: str | None = None) -> list[StoredSession]:
         with self._connection() as connection:
-            rows = connection.execute(
-                """
-                SELECT id FROM chat_sessions
-                ORDER BY updated_at DESC
-                LIMIT 100
-                """,
-            ).fetchall()
+            if profile_id is None:
+                rows = connection.execute(
+                    """
+                    SELECT id FROM chat_sessions
+                    ORDER BY updated_at DESC
+                    LIMIT 100
+                    """,
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    """
+                    SELECT id FROM chat_sessions
+                    WHERE profile_id = ?
+                    ORDER BY updated_at DESC
+                    LIMIT 100
+                    """,
+                    (profile_id,),
+                ).fetchall()
             return [self._load_session(connection, row["id"]) for row in rows]
 
     def get(self, session_id: str) -> StoredSession:
         with self._connection() as connection:
             return self._load_session(connection, session_id)
 
-    def clear(self) -> None:
+    def clear(self, profile_id: str | None = None) -> None:
         with self._connection() as connection:
-            connection.execute("DELETE FROM chat_sessions")
+            if profile_id is None:
+                connection.execute("DELETE FROM chat_sessions")
+            else:
+                connection.execute(
+                    "DELETE FROM chat_sessions WHERE profile_id = ?",
+                    (profile_id,),
+                )
 
     def append_exchange(
         self,
@@ -280,15 +345,22 @@ class ChatSessionService:
         repository: ChatSessionRepository,
         agent: Agent,
         memory_repository: MemoryRepository | None = None,
+        memory_extractor: MemoryExtractor | None = None,
+        profile_repository: ProfileRepository | None = None,
+        profile_interviewer: ProfileInterviewer | None = None,
     ) -> None:
         self._repository = repository
         self._agent = agent
         self._memory_repository = memory_repository
+        self._memory_extractor = memory_extractor
+        self._profile_repository = profile_repository
+        self._profile_interviewer = profile_interviewer
 
     @staticmethod
     def _summary(session: StoredSession) -> ChatSessionSummary:
         return ChatSessionSummary(
             id=session.id,
+            profile_id=session.profile_id,
             title=session.title,
             created_at=session.created_at,
             updated_at=session.updated_at,
@@ -304,12 +376,184 @@ class ChatSessionService:
             created_at=message.created_at,
         )
 
-    def create(self) -> ChatSession:
-        session = self._repository.create()
+    @staticmethod
+    def _profile_context(profile: StoredProfile) -> ProfileContext:
+        return {
+            "name": profile.name,
+            "description": profile.description,
+            "language": profile.language,
+            "tone": profile.tone,
+            "detail_level": profile.detail_level,
+            "response_format": profile.response_format,
+            "constraints": list(profile.constraints),
+        }
+
+    @classmethod
+    def _response(cls, updated: StoredSession) -> ChatSendResponse:
+        return ChatSendResponse(
+            session=cls._summary(updated),
+            user_message=cls._message(updated.messages[-2]),
+            assistant_message=cls._message(updated.messages[-1]),
+        )
+
+    def _memory_context(
+        self,
+        session_id: str,
+        profile_id: str,
+    ) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+        if self._memory_repository is None:
+            return [], []
+        return (
+            [
+                {"category": memory.category, "content": memory.content}
+                for memory in self._memory_repository.list_working(session_id)
+            ],
+            [
+                {"category": memory.category, "content": memory.content}
+                for memory in self._memory_repository.list_long_term(profile_id)
+            ],
+        )
+
+    @staticmethod
+    def _pending_request(session: StoredSession) -> str | None:
+        return next(
+            (
+                message.content
+                for message in session.messages
+                if message.role == "user" and message.kind == "message"
+            ),
+            None,
+        )
+
+    def _finish_onboarding(
+        self,
+        *,
+        session: StoredSession,
+        content: str,
+        profile: StoredProfile,
+    ) -> ChatSendResponse:
+        pending_request = self._pending_request(session)
+        if pending_request is None:
+            answer = (
+                "Профиль готов. Теперь напишите задачу — дальше я буду учитывать "
+                "эти настройки автоматически."
+            )
+            return self._response(
+                self._repository.append_exchange(session.id, content.strip(), answer),
+            )
+
+        working_memory, long_term_memory = self._memory_context(
+            session.id,
+            session.profile_id,
+        )
+        profile_context = self._profile_context(profile)
+        answer = self._agent.respond(
+            [],
+            pending_request,
+            profile=profile_context,
+            working_memory=working_memory,
+            long_term_memory=long_term_memory,
+        )
+        updated = self._repository.append_exchange(session.id, content.strip(), answer)
+        self._remember(
+            session_id=session.id,
+            profile_id=session.profile_id,
+            profile=profile_context,
+            context=[],
+            content=pending_request,
+            working_memory=working_memory,
+            long_term_memory=long_term_memory,
+        )
+        return self._response(updated)
+
+    def _onboard(
+        self,
+        *,
+        session: StoredSession,
+        content: str,
+        profile: StoredProfile,
+    ) -> ChatSendResponse:
+        assert self._profile_repository is not None
+        assert self._profile_interviewer is not None
+
+        normalized = content.strip().casefold()
+        if normalized in {"/skip", "skip", "пропустить", "пропусти", "по умолчанию"}:
+            completed = self._profile_repository.apply_interview_update(
+                profile.id,
+                {},
+                next_step=3,
+                complete=True,
+            )
+            return self._finish_onboarding(
+                session=session,
+                content=content,
+                profile=completed,
+            )
+
+        if profile.onboarding_step == 0:
+            self._profile_repository.apply_interview_update(
+                profile.id,
+                {},
+                next_step=1,
+                complete=False,
+            )
+            updated = self._repository.append_exchange(
+                session.id,
+                content.strip(),
+                self._profile_interviewer.questions[1],
+            )
+            return self._response(updated)
+
+        step = profile.onboarding_step
+        try:
+            inference = self._profile_interviewer.extract(
+                step=step,
+                answer=content,
+                profile=self._profile_context(profile),
+            )
+        except ProfileInterviewError:
+            logger.warning("Automatic profile extraction failed", exc_info=True)
+            answer = (
+                "Не получилось надёжно разобрать ответ. Попробуйте сформулировать "
+                "ещё раз.\n\n" + self._profile_interviewer.questions[step]
+            )
+            return self._response(
+                self._repository.append_exchange(session.id, content.strip(), answer),
+            )
+
+        next_step = min(step + 1, 3)
+        complete = step == 3
+        updated_profile = self._profile_repository.apply_interview_update(
+            profile.id,
+            inference.values(),
+            next_step=next_step,
+            complete=complete,
+        )
+        if complete:
+            return self._finish_onboarding(
+                session=session,
+                content=content,
+                profile=updated_profile,
+            )
+
+        answer = self._profile_interviewer.questions[next_step]
+        return self._response(
+            self._repository.append_exchange(session.id, content.strip(), answer),
+        )
+
+    def create(self, profile_id: str = DEFAULT_PROFILE_ID) -> ChatSession:
+        if self._profile_repository is not None:
+            self._profile_repository.get(profile_id)
+        session = self._repository.create(profile_id)
         return ChatSession(**self._summary(session).model_dump(), messages=[])
 
-    def list(self) -> list[ChatSessionSummary]:
-        return [self._summary(session) for session in self._repository.list()]
+    def list(self, profile_id: str | None = None) -> list[ChatSessionSummary]:
+        if profile_id is not None and self._profile_repository is not None:
+            self._profile_repository.get(profile_id)
+        return [
+            self._summary(session)
+            for session in self._repository.list(profile_id)
+        ]
 
     def get(self, session_id: str) -> ChatSession:
         session = self._repository.get(session_id)
@@ -318,36 +562,118 @@ class ChatSessionService:
             messages=[self._message(message) for message in session.messages],
         )
 
-    def clear(self) -> None:
-        self._repository.clear()
+    def clear(self, profile_id: str | None = None) -> None:
+        if profile_id is not None and self._profile_repository is not None:
+            self._profile_repository.get(profile_id)
+        self._repository.clear(profile_id)
+
+    @staticmethod
+    def _memory_key(
+        layer: str,
+        category: str,
+        content: str,
+    ) -> tuple[str, str, str]:
+        normalized_content = " ".join(content.split()).casefold()
+        return layer, category, normalized_content
+
+    def _remember(
+        self,
+        *,
+        session_id: str,
+        profile_id: str,
+        profile: ProfileContext | None,
+        context: list[AgentMessage],
+        content: str,
+        working_memory: list[dict[str, str]],
+        long_term_memory: list[dict[str, str]],
+    ) -> None:
+        if self._memory_repository is None or self._memory_extractor is None:
+            return
+
+        try:
+            candidates = self._memory_extractor.extract(
+                context=context,
+                current_message=content,
+                profile=profile,
+                working_memory=working_memory,
+                long_term_memory=long_term_memory,
+            )
+            known = {
+                self._memory_key(
+                    "working",
+                    memory["category"],
+                    memory["content"],
+                )
+                for memory in working_memory
+            }
+            known.update(
+                self._memory_key(
+                    "long_term",
+                    memory["category"],
+                    memory["content"],
+                )
+                for memory in long_term_memory
+            )
+            for candidate in candidates:
+                key = self._memory_key(
+                    candidate.layer,
+                    candidate.category,
+                    candidate.content,
+                )
+                if key in known:
+                    continue
+                self._memory_repository.add(
+                    layer=candidate.layer,
+                    category=candidate.category,
+                    content=candidate.content,
+                    session_id=session_id if candidate.layer == "working" else None,
+                    profile_id=profile_id if candidate.layer == "long_term" else None,
+                )
+                known.add(key)
+        except MemoryExtractionError:
+            logger.warning("Automatic memory extraction failed", exc_info=True)
+        except Exception:
+            logger.exception("Automatic memory persistence failed")
 
     def send(self, session_id: str, content: str) -> ChatSendResponse:
         session = self._repository.get(session_id)
+        profile = None
+        if self._profile_repository is not None:
+            stored_profile = self._profile_repository.get(session.profile_id)
+            if (
+                self._profile_interviewer is not None
+                and not stored_profile.onboarding_complete
+            ):
+                return self._onboard(
+                    session=session,
+                    content=content,
+                    profile=stored_profile,
+                )
+            profile = self._profile_context(stored_profile)
         context: list[AgentMessage] = [
             {"role": message.role, "content": message.content}
             for message in session.messages
             if message.kind == "message"
         ]
-        working_memory = []
-        long_term_memory = []
-        if self._memory_repository is not None:
-            working_memory = [
-                {"category": memory.category, "content": memory.content}
-                for memory in self._memory_repository.list_working(session_id)
-            ]
-            long_term_memory = [
-                {"category": memory.category, "content": memory.content}
-                for memory in self._memory_repository.list_long_term()
-            ]
+        working_memory, long_term_memory = self._memory_context(
+            session_id,
+            session.profile_id,
+        )
         answer = self._agent.respond(
             context,
             content,
+            profile=profile,
             working_memory=working_memory,
             long_term_memory=long_term_memory,
         )
         updated = self._repository.append_exchange(session_id, content.strip(), answer)
-        return ChatSendResponse(
-            session=self._summary(updated),
-            user_message=self._message(updated.messages[-2]),
-            assistant_message=self._message(updated.messages[-1]),
+        self._remember(
+            session_id=session_id,
+            profile_id=session.profile_id,
+            profile=profile,
+            context=context,
+            content=content,
+            working_memory=working_memory,
+            long_term_memory=long_term_memory,
         )
+        return self._response(updated)
