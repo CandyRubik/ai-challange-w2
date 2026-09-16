@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class StrictModel(BaseModel):
@@ -30,16 +30,62 @@ class ChatMessage(StrictModel):
     created_at: datetime
 
 
+class TaskStartRequest(StrictModel):
+    task: Annotated[str, Field(min_length=1, max_length=12_000)]
+
+
+class TaskActionRequest(StrictModel):
+    action: Literal["advance", "approve", "pause", "resume", "replan"]
+    revision: Annotated[int, Field(ge=0)]
+    content: Annotated[str, Field(max_length=4_000)] = ""
+
+    @model_validator(mode="after")
+    def require_replan_note(self) -> "TaskActionRequest":
+        if self.action == "replan" and not self.content:
+            raise ValueError("Укажите, что изменить в плане")
+        if self.action != "replan" and self.content:
+            raise ValueError("Комментарий допустим только для пересмотра плана")
+        return self
+
+
+class TaskSummary(StrictModel):
+    state: Literal["planning", "execution", "validation", "done"]
+    step: int
+    total: int
+    current: str
+    paused: bool
+    revision: int
+
+
+class TaskStepResult(StrictModel):
+    title: str
+    output: str
+
+
+class TaskView(TaskSummary):
+    task: str
+    expected_action: Literal["generate_plan", "approve_plan", "execute_step", "validate", "none"]
+    plan: tuple[str, ...]
+    done: tuple[TaskStepResult, ...]
+    criteria: tuple[str, ...]
+    notes: tuple[str, ...]
+    previous_results: tuple[TaskStepResult, ...]
+    validation_report: str
+    result: str
+
+
 class ChatSessionSummary(StrictModel):
     id: str
     profile_id: str
     title: str
     created_at: datetime
     updated_at: datetime
+    task: TaskSummary | None = None
 
 
 class ChatSession(ChatSessionSummary):
     messages: list[ChatMessage]
+    task: TaskView | None = None
 
 
 class ChatSendResponse(StrictModel):

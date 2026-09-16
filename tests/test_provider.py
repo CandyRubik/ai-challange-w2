@@ -4,7 +4,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.providers.deepseek import CONTINUATION_PROMPT, DeepSeekProvider, LlmRequestError
+from app.providers.deepseek import (
+    CONTINUATION_PROMPT, DeepSeekProvider, LlmRequestError, LlmTruncatedResponseError,
+)
 
 
 class FakeCompletions:
@@ -81,6 +83,58 @@ def test_provider_forwards_agent_context() -> None:
 
     assert provider.generate(messages=messages) == "Новый ответ"
     assert completions.requests[0]["messages"] == messages
+
+
+def test_json_response_uses_json_mode_and_requested_budget() -> None:
+    completions = FakeCompletions(completion('{"passed":true,"report":"Итог","repair_steps":[]}'))
+    provider = DeepSeekProvider(client=client(completions))  # type: ignore[arg-type]
+    messages = [{"role": "user", "content": "Проверь результат и верни JSON"}]
+    answer = provider.generate_json(messages=messages, max_tokens=8_000)
+    assert '"passed":true' in answer
+    assert completions.requests[0]["response_format"] == {"type": "json_object"}
+    assert completions.requests[0]["max_tokens"] == 8_000
+    assert completions.requests[0]["messages"] == messages
+
+
+def test_json_truncation_restarts_instead_of_concatenating_fragments() -> None:
+    full_answer = '{"passed":true,"report":"Итог","repair_steps":[]}'
+    completions = FakeCompletions(
+        completion('{"passed":true,"report":"Оборванный', finish_reason="length"),
+        completion(full_answer),
+    )
+    provider = DeepSeekProvider(client=client(completions))  # type: ignore[arg-type]
+    messages = [{"role": "user", "content": "Верни JSON"}]
+    assert provider.generate_json(messages=messages, max_tokens=8_000) == full_answer
+    assert len(completions.requests) == 2
+    assert completions.requests[1]["messages"] == messages
+    assert completions.requests[1]["response_format"] == {"type": "json_object"}
+    assert completions.requests[1]["extra_body"] == {"thinking": {"type": "disabled"}}
+
+
+@pytest.mark.parametrize("thinking_enabled", [True, False])
+def test_incomplete_json_is_rejected_with_bounded_retries(thinking_enabled: bool) -> None:
+    responses = [completion('{"report":"Оборванный', finish_reason="length")] * (2 if thinking_enabled else 1)
+    completions = FakeCompletions(*responses)
+    provider = DeepSeekProvider(client=client(completions), thinking_enabled=thinking_enabled)  # type: ignore[arg-type]
+    with pytest.raises(LlmTruncatedResponseError):
+        provider.generate_json(messages=[{"role": "user", "content": "Верни JSON"}])
+    assert len(completions.requests) == len(responses)
+
+
+def test_empty_json_retry_preserves_json_mode() -> None:
+    completions = FakeCompletions(completion(""), completion('{"report":"Итог"}'))
+    provider = DeepSeekProvider(client=client(completions))  # type: ignore[arg-type]
+    assert provider.generate_json(messages=[{"role": "user", "content": "Верни JSON"}]) == '{"report":"Итог"}'
+    assert all(request["response_format"] == {"type": "json_object"} for request in completions.requests)
+
+
+def test_provider_failure_logs_metadata_without_raw_upstream_error(caplog) -> None:
+    completions = FakeCompletions(ValueError("PRIVATE_UPSTREAM_BODY"))
+    provider = DeepSeekProvider(client=client(completions))  # type: ignore[arg-type]
+    with pytest.raises(LlmRequestError):
+        provider.generate_json(messages=[{"role": "user", "content": "Верни JSON"}])
+    assert "type=ValueError" in caplog.text
+    assert "PRIVATE_UPSTREAM_BODY" not in caplog.text
 
 
 def test_provider_continues_an_answer_cut_by_token_limit() -> None:

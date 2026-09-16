@@ -1,19 +1,21 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
-from contextlib import contextmanager
-from dataclasses import dataclass
+from contextlib import AbstractContextManager, contextmanager
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import logging
 from pathlib import Path
 import sqlite3
+from threading import Lock
 from typing import Protocol
 from uuid import uuid4
 
 from ..agents.agent import Agent, AgentMessage, ProfileContext
 from ..agents.memory_extractor import MemoryExtractionError, MemoryExtractor
 from ..agents.profile_interviewer import ProfileInterviewError, ProfileInterviewer
-from ..schemas import ChatMessage, ChatSendResponse, ChatSession, ChatSessionSummary
+from ..schemas import ChatMessage, ChatSendResponse, ChatSession, ChatSessionSummary, TaskActionRequest, TaskSummary, TaskView
+from ..agents.task_state import TaskContext, TaskConflict, TaskState, approve_plan, complete_step, pause, replan, resume, transition
 from .memory import MemoryRepository
 from .profiles import (
     DEFAULT_PROFILE_ID,
@@ -42,6 +44,13 @@ class StoredMessage:
 
 
 @dataclass(frozen=True, slots=True)
+class StoredTask:
+    context: TaskContext
+    revision: int
+    progress_revision: int
+
+
+@dataclass(frozen=True, slots=True)
 class StoredSession:
     id: str
     profile_id: str
@@ -49,6 +58,7 @@ class StoredSession:
     created_at: datetime
     updated_at: datetime
     messages: tuple[StoredMessage, ...] = ()
+    task: StoredTask | None = None
 
 
 class ChatSessionRepository(Protocol):
@@ -70,12 +80,27 @@ class ChatSessionRepository(Protocol):
     def append_command(self, session_id: str, command_text: str) -> StoredSession: ...
 
 
+    def task_operation(self, session_id: str) -> AbstractContextManager[None]: ...
+
+    def create_task(self, session_id: str, task: TaskContext) -> StoredSession: ...
+
+    def update_task(
+        self, session_id: str, task: TaskContext,
+        user_content: str, assistant_content: str, *,
+        expected_revision: int | None = None,
+        expected_progress_revision: int | None = None,
+        pause_only: bool = False,
+    ) -> StoredSession: ...
+
+
 class SQLiteChatSessionRepository:
     """Durable chat history isolated behind a repository boundary."""
 
     def __init__(self, database_path: str | Path = DEFAULT_CHAT_DB_PATH) -> None:
         self._database_path = Path(database_path)
         self._database_path.parent.mkdir(parents=True, exist_ok=True)
+        self._task_locks: dict[str, Lock] = {}
+        self._task_locks_guard = Lock()
         self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
@@ -124,6 +149,13 @@ class SQLiteChatSessionRepository:
 
                 CREATE INDEX IF NOT EXISTS idx_chat_messages_session
                 ON chat_messages(session_id, position);
+
+                CREATE TABLE IF NOT EXISTS chat_tasks (
+                    session_id TEXT PRIMARY KEY REFERENCES chat_sessions(id) ON DELETE CASCADE,
+                    context TEXT NOT NULL,
+                    revision INTEGER NOT NULL DEFAULT 0,
+                    progress_revision INTEGER NOT NULL DEFAULT 0
+                );
                 """,
             )
             session_columns = {
@@ -204,6 +236,15 @@ class SQLiteChatSessionRepository:
             )
             for message in message_rows
         )
+        task_row = connection.execute(
+            "SELECT context, revision, progress_revision FROM chat_tasks WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        task = None if task_row is None else StoredTask(
+            context=TaskContext.from_json(task_row["context"]),
+            revision=task_row["revision"],
+            progress_revision=task_row["progress_revision"],
+        )
         return StoredSession(
             id=row["id"],
             profile_id=row["profile_id"] or DEFAULT_PROFILE_ID,
@@ -211,6 +252,7 @@ class SQLiteChatSessionRepository:
             created_at=self._datetime(row["created_at"]),
             updated_at=self._datetime(row["updated_at"]),
             messages=messages,
+            task=task,
         )
 
     def create(self, profile_id: str = DEFAULT_PROFILE_ID) -> StoredSession:
@@ -235,6 +277,7 @@ class SQLiteChatSessionRepository:
 
     def list(self, profile_id: str | None = None) -> list[StoredSession]:
         with self._connection() as connection:
+            connection.execute("BEGIN")
             if profile_id is None:
                 rows = connection.execute(
                     """
@@ -257,6 +300,7 @@ class SQLiteChatSessionRepository:
 
     def get(self, session_id: str) -> StoredSession:
         with self._connection() as connection:
+            connection.execute("BEGIN")
             return self._load_session(connection, session_id)
 
     def clear(self, profile_id: str | None = None) -> None:
@@ -275,37 +319,10 @@ class SQLiteChatSessionRepository:
         user_content: str,
         assistant_content: str,
     ) -> StoredSession:
-        now = datetime.now(timezone.utc)
-        timestamp = self._timestamp(now)
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             session = self._load_session(connection, session_id)
-            position = len(session.messages)
-            title = session.title
-            if not session.messages:
-                title = user_content.replace("\n", " ").strip()[:60] or "Новый чат"
-
-            connection.executemany(
-                """
-                INSERT INTO chat_messages
-                    (id, session_id, position, role, kind, content, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                [
-                    (
-                        str(uuid4()), session_id, position, "user", "message",
-                        user_content, timestamp,
-                    ),
-                    (
-                        str(uuid4()), session_id, position + 1, "assistant", "message",
-                        assistant_content, timestamp,
-                    ),
-                ],
-            )
-            connection.execute(
-                "UPDATE chat_sessions SET title = ?, updated_at = ? WHERE id = ?",
-                (title, timestamp, session_id),
-            )
+            self._append_exchange(connection, session, user_content, assistant_content)
 
         return self.get(session_id)
 
@@ -337,6 +354,96 @@ class SQLiteChatSessionRepository:
         return self.get(session_id)
 
 
+    def _append_exchange(
+        self, connection: sqlite3.Connection, session: StoredSession,
+        user_content: str, assistant_content: str,
+    ) -> None:
+        timestamp = self._timestamp(datetime.now(timezone.utc))
+        position = len(session.messages)
+        title = session.title
+        if not session.messages:
+            title = user_content.replace("\n", " ").strip()[:60] or "Новый чат"
+        connection.executemany(
+            """
+            INSERT INTO chat_messages
+                (id, session_id, position, role, content, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (str(uuid4()), session.id, position, "user", user_content, timestamp),
+                (str(uuid4()), session.id, position + 1, "assistant", assistant_content, timestamp),
+            ],
+        )
+        connection.execute(
+            "UPDATE chat_sessions SET title = ?, updated_at = ? WHERE id = ?",
+            (title, timestamp, session.id),
+        )
+
+    @contextmanager
+    def task_operation(self, session_id: str) -> Iterator[None]:
+        # The repository is shared by requests. Pause/resume deliberately bypass
+        # this lock; a running generation can finish into a paused snapshot.
+        with self._task_locks_guard:
+            lock = self._task_locks.setdefault(session_id, Lock())
+        if not lock.acquire(blocking=False):
+            raise TaskConflict("Шаг уже выполняется. Дождитесь ответа агента")
+        try:
+            yield
+        finally:
+            lock.release()
+
+    def create_task(self, session_id: str, task: TaskContext) -> StoredSession:
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            session = self._load_session(connection, session_id)
+            if session.task is not None:
+                raise TaskConflict("В этом чате уже есть задача. Создайте новый чат")
+            connection.execute(
+                "INSERT INTO chat_tasks (session_id, context) VALUES (?, ?)",
+                (session_id, task.to_json()),
+            )
+            self._append_exchange(
+                connection, session, "Задача: " + task.task,
+                "Задача создана. Нажмите «Сформировать план», затем утвердите его.",
+            )
+        return self.get(session_id)
+
+    def update_task(
+        self, session_id: str, task: TaskContext,
+        user_content: str, assistant_content: str, *,
+        expected_revision: int | None = None,
+        expected_progress_revision: int | None = None,
+        pause_only: bool = False,
+    ) -> StoredSession:
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            session = self._load_session(connection, session_id)
+            stored = session.task
+            if stored is None:
+                raise TaskConflict("В чате нет задачи")
+            if expected_revision is not None and stored.revision != expected_revision:
+                raise TaskConflict("Состояние изменилось. Обновите чат и повторите действие")
+            if expected_progress_revision is not None:
+                if stored.progress_revision != expected_progress_revision:
+                    raise TaskConflict("Состояние задачи изменилось во время выполнения")
+                # A pause arriving during successful validation is acknowledged
+                # as completed: DONE is terminal and cannot remain paused.
+                task = replace(
+                    task, paused=stored.context.paused and task.state != TaskState.DONE,
+                )
+            connection.execute(
+                """
+                UPDATE chat_tasks
+                SET context = ?, revision = revision + 1,
+                    progress_revision = progress_revision + ?
+                WHERE session_id = ?
+                """,
+                (task.to_json(), 0 if pause_only else 1, session_id),
+            )
+            self._append_exchange(connection, session, user_content, assistant_content)
+        return self.get(session_id)
+
+
 class ChatSessionService:
     """Adapt persistent sessions to the storage-agnostic Agent."""
 
@@ -364,6 +471,14 @@ class ChatSessionService:
             title=session.title,
             created_at=session.created_at,
             updated_at=session.updated_at,
+            task=None if session.task is None else TaskSummary(
+                state=session.task.context.state,
+                step=session.task.context.step,
+                total=session.task.context.total,
+                current=session.task.context.current,
+                paused=session.task.context.paused,
+                revision=session.task.revision,
+            ),
         )
 
     @staticmethod
@@ -558,8 +673,11 @@ class ChatSessionService:
     def get(self, session_id: str) -> ChatSession:
         session = self._repository.get(session_id)
         return ChatSession(
-            **self._summary(session).model_dump(),
+            **self._summary(session).model_dump(exclude={"task"}),
             messages=[self._message(message) for message in session.messages],
+            task=None if session.task is None else TaskView(
+                **session.task.context.to_dict(), revision=session.task.revision,
+            ),
         )
 
     def clear(self, profile_id: str | None = None) -> None:
@@ -637,6 +755,8 @@ class ChatSessionService:
 
     def send(self, session_id: str, content: str) -> ChatSendResponse:
         session = self._repository.get(session_id)
+        if session.task is not None and session.task.context.state != TaskState.DONE:
+            raise TaskConflict("Используйте действия задачи или пересмотрите план")
         profile = None
         if self._profile_repository is not None:
             stored_profile = self._profile_repository.get(session.profile_id)
@@ -677,3 +797,94 @@ class ChatSessionService:
             long_term_memory=long_term_memory,
         )
         return self._response(updated)
+
+
+    def start_task(self, session_id: str, task: str) -> ChatSession:
+        session = self._repository.get(session_id)
+        if self._profile_repository is not None and self._profile_interviewer is not None:
+            profile = self._profile_repository.get(session.profile_id)
+            if not profile.onboarding_complete:
+                raise TaskConflict("Сначала завершите интервью профиля или отправьте /skip в обычном чате")
+        self._repository.create_task(session_id, TaskContext(task=task.strip()))
+        return self.get(session_id)
+
+    def task_action(self, session_id: str, request: TaskActionRequest) -> ChatSession:
+        if request.action in {"pause", "resume"}:
+            return self._apply_task_action(session_id, request)
+        with self._repository.task_operation(session_id):
+            return self._apply_task_action(session_id, request)
+
+    def _apply_task_action(self, session_id: str, request: TaskActionRequest) -> ChatSession:
+        session = self._repository.get(session_id)
+        stored = session.task
+        if stored is None:
+            raise TaskConflict("В чате нет задачи")
+        if request.revision != stored.revision:
+            raise TaskConflict("Состояние изменилось. Обновите чат и повторите действие")
+        ctx = stored.context
+        action = request.action
+        if action == "pause":
+            updated, answer = pause(ctx), "Задача на паузе. Этап, шаг и результаты сохранены."
+        elif action == "resume":
+            updated = resume(ctx)
+            answer = "Продолжаем с сохранённого состояния. Ожидаемое действие: " + ctx.current
+        elif action == "approve":
+            updated = approve_plan(ctx)
+            answer = "План утверждён. Следующий шаг: " + updated.current
+        elif action == "replan":
+            updated = replan(ctx, request.content)
+            answer = "Требования сохранены. Сформируйте новый план; готовые результаты доступны агенту."
+        else:
+            if ctx.paused:
+                raise TaskConflict("Задача на паузе. Сначала нажмите «Продолжить»")
+            profile = None if self._profile_repository is None else self._profile_context(
+                self._profile_repository.get(session.profile_id),
+            )
+            working_memory, long_term_memory = self._memory_context(session_id, session.profile_id)
+            updated, answer = self._advance_task(
+                ctx, profile=profile,
+                working_memory=working_memory, long_term_memory=long_term_memory,
+            )
+        is_generation = action == "advance"
+        self._repository.update_task(
+            session_id, updated,
+            {"advance": ctx.current, "approve": "Утвердить план", "pause": "Пауза",
+             "resume": "Продолжить", "replan": "Пересмотреть план: " + request.content}[action],
+            answer,
+            expected_revision=None if is_generation else request.revision,
+            expected_progress_revision=stored.progress_revision if is_generation else None,
+            pause_only=action in {"pause", "resume"},
+        )
+        return self.get(session_id)
+
+    def _advance_task(self, ctx: TaskContext, **context) -> tuple[TaskContext, str]:
+        if ctx.expected_action == "generate_plan":
+            output = self._agent.plan_task(ctx, **context)
+            updated = replace(ctx, plan=tuple(output.plan), criteria=tuple(output.criteria))
+            answer = output.summary + "\n\nПлан:\n" + "\n".join(
+                f"{index}. {title}" for index, title in enumerate(output.plan, 1)
+            ) + "\n\nКритерии готовности:\n" + "\n".join(
+                "• " + criterion for criterion in output.criteria
+            ) + "\n\nУтвердите план или укажите изменения."
+            return updated, answer
+        if ctx.expected_action == "execute_step":
+            answer = self._agent.execute_task_step(ctx, **context)
+            return complete_step(ctx, answer), answer
+        if ctx.expected_action == "validate":
+            output = self._agent.validate_task(ctx, **context)
+            if output.passed:
+                updated = transition(
+                    ctx, TaskState.DONE, result=output.report,
+                    validation_report=output.report,
+                )
+            else:
+                updated = transition(
+                    ctx, TaskState.EXECUTION,
+                    plan=(*ctx.plan, *output.repair_steps),
+                    validation_report=output.report,
+                )
+            answer = output.report
+            if not output.passed:
+                answer += "\n\nШаги исправления:\n" + "\n".join(output.repair_steps)
+            return updated, answer
+        raise TaskConflict("Сейчас нужно утвердить план или задача уже завершена")

@@ -39,6 +39,30 @@ const longTermMemory = document.querySelector("#long-term-memory");
 const shortTermCount = document.querySelector("#short-term-count");
 const workingCount = document.querySelector("#working-count");
 const longTermCount = document.querySelector("#long-term-count");
+const startTaskButton = document.querySelector("#start-task");
+const refreshButton = document.querySelector("#refresh-session");
+const taskPanel = document.querySelector("#task-panel");
+const taskOverview = document.querySelector("#task-overview");
+const taskToolbar = document.querySelector("#task-toolbar");
+const memoryView = document.querySelector("#memory-view");
+const inspectorTabs = document.querySelector("#inspector-tabs");
+const processTab = document.querySelector("#process-tab");
+const memoryTab = document.querySelector("#memory-tab");
+const showProcessButton = document.querySelector("#show-task-process");
+const advanceButton = document.querySelector("#task-advance");
+const pauseButton = document.querySelector("#task-pause");
+const resumeButton = document.querySelector("#task-resume");
+const replanButton = document.querySelector("#task-replan");
+const STAGES = { planning: "Планирование", execution: "Выполнение", validation: "Проверка", done: "Готово" };
+const ACTIONS = { generate_plan: "Сформировать план", approve_plan: "Утвердить план", execute_step: "Выполнить шаг", validate: "Проверить результат", none: "Задача завершена" };
+let currentSession = null;
+let taskRunning = false;
+let controlBusy = false;
+let inspectorMode = "memory";
+let renderedTaskSessionId = null;
+let taskOperation = null;
+let taskTimer = null;
+let taskError = "";
 let sessions = [];
 let profiles = [];
 let currentProfileId = null;
@@ -102,7 +126,266 @@ function setBusy(value) {
   profileSelect.disabled = value;
   newProfileButton.disabled = value;
   editProfileButton.disabled = value;
-  if (value) status.textContent = "Агент отвечает…";
+  syncControls();
+  if (value) status.textContent = readyStatus();
+}
+
+function syncControls() {
+  const task = currentSession?.task;
+  const active = task && task.state !== "done";
+  const blocked = busy || controlBusy;
+  input.disabled = Boolean(controlBusy || taskRunning || active);
+  form.querySelector('button[type="submit"]').disabled = Boolean(controlBusy || taskRunning || active);
+  startTaskButton.disabled = Boolean(blocked || task || !activeProfile()?.onboarding_complete);
+  newButton.disabled = blocked || activeProfile()?.onboarding_complete === false;
+  profileSelect.disabled = blocked;
+  newProfileButton.disabled = blocked;
+  editProfileButton.disabled = blocked;
+  startTaskButton.title = activeProfile()?.onboarding_complete ? "Создать пошаговую задачу" : "Сначала завершите интервью в обычном чате или отправьте /skip";
+  clearDatabaseButton.disabled = blocked;
+  refreshButton.disabled = blocked;
+  form.hidden = Boolean(active);
+  taskToolbar.hidden = !active;
+  input.placeholder = "Сообщение или /команда…";
+  if (!task) return;
+  advanceButton.textContent = taskRunning ? "Выполняется…" : ACTIONS[task.expected_action];
+  advanceButton.hidden = task.state === "done";
+  advanceButton.disabled = blocked || task.paused;
+  pauseButton.hidden = task.paused || task.state === "done";
+  pauseButton.disabled = controlBusy || (busy && !taskRunning);
+  resumeButton.hidden = !task.paused;
+  resumeButton.disabled = blocked;
+  replanButton.hidden = !["planning", "execution"].includes(task.state);
+  replanButton.disabled = blocked || task.paused;
+  document.querySelector("#task-note").textContent = task.paused
+    ? (taskRunning ? "Пауза запрошена. Текущий ответ завершится и сохранится; следующий шаг не начнётся." : "Состояние сохранено. «Продолжить» снимет паузу, затем можно выполнить ожидаемое действие.")
+    : (task.state === "done" ? "Итог сохранён в истории и результатах задачи. Для новой задачи создайте новый чат." : "Одно нажатие выполняет одно действие. Состояние сохраняется после каждого действия.");
+  renderTaskActivity(task);
+}
+
+function readyStatus() {
+  if (busy) return taskRunning ? (currentSession?.task?.paused ? "Завершаю ответ…" : "Выполняется…") : "Агент отвечает…";
+  if (currentSession?.task?.paused) return "На паузе";
+  return currentSession?.task?.state === "done" ? "Задача завершена" : "Готов";
+}
+
+function setInspector(mode) {
+  inspectorMode = currentSession?.task ? mode : "memory";
+  taskPanel.hidden = inspectorMode !== "process";
+  memoryView.hidden = inspectorMode !== "memory";
+  for (const [tab, name] of [[processTab, "process"], [memoryTab, "memory"]]) {
+    tab.setAttribute("aria-selected", String(inspectorMode === name));
+    tab.tabIndex = inspectorMode === name ? 0 : -1;
+  }
+}
+
+function taskIcon(name) {
+  const paths = {
+    planning: '<path d="M8 5h12M8 12h12M8 19h12M3 5h.01M3 12h.01M3 19h.01"/>',
+    execution: '<path d="m8 5 10 7-10 7z"/>',
+    validation: '<circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/>',
+    done: '<path d="m5 12 4 4L19 6"/>',
+    paused: '<path d="M8 5v14M16 5v14"/>',
+    error: '<path d="M12 5v9M12 19h.01"/>',
+  };
+  return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${paths[name] || paths.planning}</svg>`;
+}
+
+function renderTask(task) {
+  taskOverview.hidden = !task;
+  inspectorTabs.hidden = !task;
+  if (!task) {
+    renderedTaskSessionId = null;
+    taskError = "";
+    setInspector("memory");
+    return;
+  }
+  if (renderedTaskSessionId !== currentSessionId) {
+    renderedTaskSessionId = currentSessionId;
+    taskError = "";
+    setInspector("process");
+  }
+  document.querySelector("#task-title").textContent = task.task;
+  document.querySelector("#task-title").title = task.task;
+  document.querySelector("#task-progress").textContent = task.total ? `${task.step} / ${task.total} шагов` : "Плана пока нет";
+  const current = document.querySelector("#task-current");
+  current.textContent = task.current;
+  current.title = task.current;
+  const stageNames = Object.keys(STAGES);
+  document.querySelector("#task-stages").replaceChildren(...stageNames.map((name, index) => {
+    const badge = document.createElement("span");
+    badge.className = "task-stage";
+    badge.dataset.stage = name;
+    const completed = index < stageNames.indexOf(task.state);
+    if (name === task.state) {
+      badge.classList.add("active");
+      badge.setAttribute("aria-current", "step");
+    } else if (completed) badge.classList.add("completed");
+    const mark = document.createElement("span");
+    mark.className = "stage-mark";
+    mark.innerHTML = taskIcon(completed ? "done" : name);
+    const label = document.createElement("span");
+    label.textContent = STAGES[name];
+    badge.append(mark, label);
+    return badge;
+  }));
+  document.querySelector("#task-plan-details").hidden = !task.plan.length;
+  document.querySelector("#task-plan-empty").hidden = Boolean(task.plan.length);
+  document.querySelector("#task-plan").replaceChildren(...task.plan.map((item, index) => {
+    const li = document.createElement("li");
+    li.className = "task-step";
+    li.dataset.step = index;
+    const mark = document.createElement("span");
+    mark.className = "step-mark";
+    if (index < task.step) {
+      li.classList.add("completed");
+      mark.innerHTML = taskIcon("done");
+    } else mark.textContent = index + 1;
+    if (index === task.step && task.state === "execution") {
+      li.classList.add("current");
+      li.setAttribute("aria-current", "step");
+    }
+    const body = document.createElement("div");
+    const text = document.createElement("p");
+    text.textContent = item;
+    text.title = item;
+    const state = document.createElement("small");
+    state.className = "step-status";
+    state.textContent = index < task.step ? "Готово" : "В плане";
+    body.append(text, state);
+    li.append(mark, body);
+    return li;
+  }));
+  document.querySelector("#task-criteria").replaceChildren(...task.criteria.map((item) => {
+    const li = document.createElement("li");
+    li.textContent = item;
+    return li;
+  }));
+  const results = [
+    ...task.previous_results.map((item) => ({ ...item, title: `Предыдущий план: ${item.title}` })),
+    ...task.done,
+  ];
+  if (task.result) results.push({ title: "Итоговый результат", output: task.result });
+  document.querySelector("#task-results-details").hidden = !results.length;
+  document.querySelector("#task-results-summary").textContent = `Сохранённые результаты (${results.length})`;
+  document.querySelector("#task-results").replaceChildren(...results.map((item) => {
+    const detail = document.createElement("details");
+    detail.className = "saved-result";
+    const summary = document.createElement("summary");
+    summary.textContent = item.title;
+    const text = document.createElement("p");
+    text.textContent = item.output;
+    detail.append(summary, text);
+    return detail;
+  }));
+  renderTaskActivity(task);
+}
+
+function elapsedTaskTime() {
+  const seconds = Math.floor((performance.now() - taskOperation.startedAt) / 1000);
+  return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
+}
+
+function updateTaskElapsed() {
+  if (!taskOperation) return;
+  const elapsed = elapsedTaskTime();
+  document.querySelector("#task-elapsed").textContent = elapsed;
+  const inlineTime = messages.querySelector(".task-wait-time");
+  if (inlineTime) inlineTime.textContent = elapsed;
+}
+
+function renderTaskActivity(task) {
+  if (!task) return;
+  const running = Boolean(taskOperation);
+  const activity = document.querySelector("#task-activity");
+  activity.classList.toggle("running", running);
+  activity.classList.toggle("paused", task.paused);
+  activity.classList.toggle("failed", Boolean(taskError));
+  const titles = {
+    generate_plan: "Составляю план",
+    execute_step: `Выполняю шаг ${(taskOperation?.step ?? task.step) + 1} из ${taskOperation?.total ?? task.total}`,
+    validate: "Проверяю результат",
+  };
+  const current = document.querySelector("#task-current");
+  current.textContent = running ? (task.paused ? "Завершаю ответ перед паузой" : titles[taskOperation.expectedAction]) : task.current;
+  current.title = running ? taskOperation.current : task.current;
+  document.querySelector("#task-activity-title").textContent = running
+    ? (task.paused ? "Завершаю ответ перед паузой" : titles[taskOperation.expectedAction])
+    : (taskError ? "Действие не завершено" : task.paused ? "Задача на паузе" : task.state === "done" ? "Задача завершена" : "Ожидается действие");
+  document.querySelector("#task-expected").textContent = running
+    ? (taskOperation.expectedAction === "execute_step" ? taskOperation.current : "Ожидаем ответ модели; результат будет сохранён.")
+    : (taskError || (task.paused ? "План и результаты сохранены." : ACTIONS[task.expected_action]));
+  activity.querySelector(".activity-icon").innerHTML = taskIcon(taskError ? "error" : task.paused ? "paused" : task.state);
+  const elapsed = document.querySelector("#task-elapsed");
+  elapsed.hidden = !running;
+  if (running) elapsed.textContent = elapsedTaskTime();
+  taskOverview.classList.toggle("running", running);
+  taskOverview.classList.toggle("paused", task.paused);
+  for (const step of document.querySelectorAll(".task-step.current")) {
+    step.classList.toggle("running", running);
+    step.classList.toggle("paused", task.paused);
+    step.querySelector(".step-status").textContent = running ? "Выполняется" : task.paused ? "На паузе" : "Следующий шаг";
+  }
+  let pending = messages.querySelector(".task-pending");
+  if (!running) {
+    pending?.remove();
+    return;
+  }
+  if (!pending) {
+    const nearBottom = messages.scrollHeight - messages.scrollTop - messages.clientHeight < 80;
+    pending = document.createElement("article");
+    pending.className = "message assistant task-pending";
+    const label = document.createElement("span");
+    label.textContent = "Агент · выполняет задачу";
+    const card = document.createElement("div");
+    card.className = "task-pending-card";
+    const heading = document.createElement("strong");
+    heading.textContent = titles[taskOperation.expectedAction];
+    const time = document.createElement("small");
+    time.className = "task-wait-time";
+    time.setAttribute("aria-label", "Время ожидания");
+    time.setAttribute("aria-live", "off");
+    const text = document.createElement("p");
+    text.textContent = taskOperation.expectedAction === "execute_step" ? taskOperation.current : "Ответ появится здесь после завершения действия.";
+    const signal = document.createElement("div");
+    signal.className = "activity-scan";
+    signal.setAttribute("aria-hidden", "true");
+    card.append(heading, time, text, signal);
+    pending.append(label, card);
+    messages.append(pending);
+    if (nearBottom) requestAnimationFrame(() => { messages.scrollTop = messages.scrollHeight; });
+  }
+  pending.classList.toggle("paused", task.paused);
+  updateTaskElapsed();
+}
+
+function startTaskActivity(task) {
+  taskError = "";
+  taskOperation = { expectedAction: task.expected_action, current: task.current, step: task.step, total: task.total, startedAt: performance.now() };
+  taskTimer = setInterval(updateTaskElapsed, 1000);
+}
+
+function stopTaskActivity() {
+  clearInterval(taskTimer);
+  taskTimer = null;
+  taskOperation = null;
+  messages.querySelector(".task-pending")?.remove();
+}
+
+function applySession(session) {
+  // A pause request and a generation can return out of order.
+  if (currentSession?.id === session.id && currentSession.task && session.task
+      && session.task.revision < currentSession.task.revision) return;
+  currentSession = session;
+  currentSessionId = session.id;
+  const { messages: ignoredMessages, ...summary } = session;
+  sessions = [summary, ...sessions.filter((item) => item.id !== session.id)];
+  title.textContent = session.title;
+  renderSessions();
+  renderTask(session.task);
+  syncControls();
+  renderMessages(session.messages);
+  status.textContent = readyStatus();
 }
 
 function activeProfile() {
@@ -137,6 +420,7 @@ function renderActiveProfile() {
     tag.textContent = constraint;
     return tag;
   }));
+  syncControls();
 }
 
 function renderProfiles() {
@@ -161,7 +445,7 @@ function rememberSelectedProfile() {
 }
 
 function openProfileDialog(profile) {
-  if (busy) return;
+  if (busy || controlBusy) return;
   profileDialogTitle.textContent = profile.onboarding_complete
     ? "Проверка профиля"
     : "Интервью не завершено";
@@ -326,9 +610,7 @@ async function executeMemoryCommand(command) {
     ]);
     sessions = updatedSessions;
     memorySnapshot = memory;
-    title.textContent = session.title;
-    renderSessions();
-    renderMessages(session.messages);
+    applySession(session);
     status.textContent = command.layer === "working"
       ? `Сохранено в рабочую память: ${command.category}`
       : `Сохранено в долговременную память: ${command.category}`;
@@ -346,7 +628,7 @@ function renderSessions() {
     const button = document.createElement("button");
     button.type = "button";
     button.className = session.id === currentSessionId ? "session active" : "session";
-    button.textContent = session.title;
+    button.textContent = `${session.title}${session.task ? ` · ${session.task.paused ? "⏸" : STAGES[session.task.state]}` : ""}`;
     button.addEventListener("click", () => openSession(session.id));
     return button;
   }));
@@ -386,7 +668,8 @@ function renderMessages(items, updateState = true) {
     article.append(label, content);
     return article;
   }));
-  messages.scrollTop = messages.scrollHeight;
+  renderTaskActivity(currentSession?.task);
+  requestAnimationFrame(() => { messages.scrollTop = messages.scrollHeight; });
 }
 
 function emptyMemory(text) {
@@ -470,18 +753,14 @@ async function deleteMemory(entry) {
 }
 
 async function openSession(sessionId) {
-  if (busy) return;
+  if (busy || controlBusy) return;
   try {
     const [session, memory] = await Promise.all([
       api(`/api/chat/sessions/${sessionId}`),
       api(`/api/memory?session_id=${encodeURIComponent(sessionId)}`),
     ]);
-    currentSessionId = session.id;
     memorySnapshot = memory;
-    title.textContent = session.title;
-    renderSessions();
-    renderMessages(session.messages);
-    status.textContent = "Готов";
+    applySession(session);
     input.focus();
   } catch (error) {
     status.textContent = error.message;
@@ -513,7 +792,7 @@ async function sendChatMessage(content) {
     title.textContent = result.session.title;
     renderSessions();
     renderProfiles();
-    renderMessages(session.messages);
+    applySession(session);
     status.textContent = "Готов";
   } catch (error) {
     renderMessages(currentMessages);
@@ -542,7 +821,7 @@ async function drainQueue() {
 }
 
 async function createSession() {
-  if (busy) return;
+  if (busy || controlBusy) return;
   try {
     const session = await api("/api/chat/sessions", {
       method: "POST",
@@ -568,6 +847,8 @@ async function loadSessions() {
 async function activateProfile(profileId) {
   currentProfileId = profileId;
   currentSessionId = null;
+  currentSession = null;
+  renderTask(null);
   currentMessages = [];
   memorySnapshot = { working: [], long_term: [] };
   queuedMessages = [];
@@ -655,14 +936,14 @@ input.addEventListener("input", () => {
 
 newButton.addEventListener("click", createSession);
 profileSelect.addEventListener("change", async () => {
-  if (busy) {
+  if (busy || controlBusy) {
     profileSelect.value = currentProfileId;
     return;
   }
   await activateProfile(profileSelect.value);
 });
 newProfileButton.addEventListener("click", async () => {
-  if (busy) return;
+  if (busy || controlBusy) return;
   setBusy(true);
   status.textContent = "Создаю автопрофиль…";
   try {
@@ -739,6 +1020,8 @@ clearDatabaseButton.addEventListener("click", async () => {
     await api(`/api/chat/sessions?profile_id=${encodeURIComponent(currentProfileId)}`, { method: "DELETE" });
     sessions = [];
     currentSessionId = null;
+    currentSession = null;
+    renderTask(null);
     title.textContent = "Новый чат";
     renderSessions();
     renderMessages([]);
@@ -751,6 +1034,92 @@ clearDatabaseButton.addEventListener("click", async () => {
   }
   await createSession();
 });
+
+startTaskButton.addEventListener("click", async () => {
+  const task = input.value.trim();
+  if (busy || controlBusy || currentSession?.task || !activeProfile()?.onboarding_complete) return;
+  if (!task) {
+    status.textContent = "Опишите цель и требования задачи в поле сообщения";
+    input.focus();
+    return;
+  }
+  setBusy(true);
+  let failed = false;
+  try {
+    const session = await api(`/api/chat/sessions/${currentSessionId}/task`, {
+      method: "POST", body: JSON.stringify({ task }),
+    });
+    input.value = "";
+    applySession(session);
+  } catch (error) {
+    failed = true;
+    status.textContent = error.message;
+  } finally {
+    setBusy(false);
+    if (!failed) status.textContent = readyStatus();
+  }
+});
+
+async function runTaskAction(action, content = "") {
+  const task = currentSession?.task;
+  if (!task || controlBusy || (busy && !(action === "pause" && taskRunning))) return;
+  const isPause = action === "pause";
+  if (isPause) controlBusy = true;
+  else {
+    taskRunning = action === "advance";
+    taskError = "";
+    if (taskRunning) startTaskActivity(task);
+    setBusy(true);
+  }
+  syncControls();
+  let failed = false;
+  try {
+    const session = await api(`/api/chat/sessions/${currentSessionId}/task/actions`, {
+      method: "POST", body: JSON.stringify({ action, revision: task.revision, content }),
+    });
+    applySession(session);
+  } catch (error) {
+    failed = true;
+    if (!isPause) taskError = error.message;
+    try { applySession(await api(`/api/chat/sessions/${currentSessionId}`)); } catch { /* Keep the last saved snapshot visible. */ }
+    status.textContent = error.message;
+  } finally {
+    if (isPause) controlBusy = false;
+    else {
+      stopTaskActivity();
+      taskRunning = false;
+      setBusy(false);
+    }
+    syncControls();
+    if (!failed) status.textContent = readyStatus();
+  }
+}
+
+advanceButton.addEventListener("click", () => runTaskAction(currentSession.task.expected_action === "approve_plan" ? "approve" : "advance"));
+pauseButton.addEventListener("click", () => runTaskAction("pause"));
+resumeButton.addEventListener("click", () => runTaskAction("resume"));
+replanButton.addEventListener("click", () => {
+  const content = window.prompt("Что изменить в плане? Завершённые результаты сохранятся.");
+  if (content?.trim()) runTaskAction("replan", content.trim());
+});
+refreshButton.addEventListener("click", () => openSession(currentSessionId));
+processTab.addEventListener("click", () => setInspector("process"));
+memoryTab.addEventListener("click", () => setInspector("memory"));
+inspectorTabs.addEventListener("keydown", (event) => {
+  if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+  event.preventDefault();
+  const mode = event.key === "Home" ? "process" : event.key === "End" ? "memory" : inspectorMode === "process" ? "memory" : "process";
+  setInspector(mode);
+  (mode === "process" ? processTab : memoryTab).focus();
+});
+showProcessButton.addEventListener("click", () => {
+  setInspector("process");
+  processTab.focus({ preventScroll: true });
+  if (window.matchMedia("(max-width: 820px)").matches) {
+    taskPanel.closest(".context-panel").scrollIntoView({ behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "instant" : "smooth", block: "start" });
+  }
+});
+
 
 renderMemory();
 renderQueue();
