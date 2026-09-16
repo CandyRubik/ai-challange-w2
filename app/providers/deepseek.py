@@ -2,12 +2,16 @@ from __future__ import annotations
 
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
+import logging
 import os
 from typing import Any
 
 from openai import OpenAI
 
 from ..agents.agent import AgentMessage
+
+
+logger = logging.getLogger(__name__)
 
 
 class LlmConfigurationError(RuntimeError):
@@ -25,6 +29,13 @@ class LlmEmptyStreamError(LlmRequestError):
         reason = f" (finish_reason={finish_reason})" if finish_reason else ""
         super().__init__(f"DeepSeek вернул пустой потоковый ответ{reason}")
         self.finish_reason = finish_reason
+
+
+class LlmTruncatedResponseError(LlmRequestError):
+    """A structured response did not fit into a single complete answer."""
+
+    def __init__(self) -> None:
+        super().__init__("DeepSeek обрезал JSON по лимиту ответа. Полная проверка не получена")
 
 
 DEFAULT_MAX_TOKENS = 2_000
@@ -172,12 +183,44 @@ class DeepSeekProvider:
         reason = f" (finish_reason={finish_reason})" if finish_reason else ""
         raise LlmRequestError(f"DeepSeek вернул пустой ответ{reason}")
 
+    def generate_json(
+        self,
+        *,
+        messages: Sequence[AgentMessage],
+        max_tokens: int = DEFAULT_MAX_TOKENS,
+    ) -> str:
+        thinking_types = ("enabled", "disabled") if self._thinking_enabled else ("disabled",)
+        finish_reason = None
+        for thinking_type in thinking_types:
+            request = self._build_chat_request(
+                messages=messages, max_tokens=max_tokens,
+                response_format={"type": "json_object"}, thinking_type=thinking_type,
+            )
+            content, finish_reason = self._extract_content(self._request_completion(request))
+            if finish_reason == "length":
+                # Restart from the original snapshot. JSON mode produces a
+                # whole object, so concatenating continuations can corrupt it.
+                logger.warning("Structured response truncated (thinking=%s max_tokens=%d)", thinking_type, max_tokens)
+                continue
+            if content:
+                return content
+            if finish_reason == "content_filter":
+                break
+        if finish_reason == "length":
+            raise LlmTruncatedResponseError()
+        reason = f" (finish_reason={finish_reason})" if finish_reason else ""
+        raise LlmRequestError(f"DeepSeek вернул пустой JSON-ответ{reason}")
+
     def _request_completion(self, request: dict[str, Any]) -> Any:
         try:
             return self._get_client().chat.completions.create(**request)
         except LlmConfigurationError:
             raise
         except Exception as error:
+            logger.warning(
+                "DeepSeek request failed: type=%s status=%s",
+                type(error).__name__, getattr(error, "status_code", None),
+            )
             raise LlmRequestError("Запрос к DeepSeek завершился ошибкой") from error
 
     @staticmethod

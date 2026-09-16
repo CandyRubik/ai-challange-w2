@@ -12,6 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from .agents.agent import Agent, AgentInputError, AgentOutputError
 from .agents.memory_extractor import MemoryExtractor
 from .agents.profile_interviewer import ProfileInterviewer
+from .agents.task_state import TaskConflict
 from .providers.deepseek import (
     DeepSeekProvider,
     LlmConfigurationError,
@@ -29,6 +30,7 @@ from .schemas import (
     UserProfile,
     UserProfileCreateRequest,
     UserProfileUpdateRequest,
+    TaskActionRequest, TaskStartRequest,
 )
 from .services.chat_sessions import (
     ChatSessionNotFound,
@@ -276,10 +278,44 @@ def send_chat_message(
         raise HTTPException(status_code=404, detail="Чат не найден") from None
     except ProfileNotFound:
         raise HTTPException(status_code=404, detail="Профиль не найден") from None
+    except TaskConflict as error:
+        raise HTTPException(status_code=409, detail=str(error)) from None
     except AgentInputError as error:
         raise HTTPException(status_code=422, detail=str(error)) from None
-    except (AgentOutputError, LlmRequestError):
-        raise HTTPException(status_code=502, detail="Запрос к модели завершился ошибкой") from None
+    except (AgentOutputError, LlmRequestError) as error:
+        raise HTTPException(status_code=502, detail=str(error)) from None
+    except LlmConfigurationError:
+        raise HTTPException(status_code=503, detail="DEEPSEEK_API_KEY не задан") from None
+
+
+@app.post("/api/chat/sessions/{session_id}/task", response_model=ChatSession, status_code=201)
+def start_task(
+    session_id: str,
+    request: TaskStartRequest,
+    service: ChatSessionService = Depends(get_chat_session_service),
+) -> ChatSession:
+    try:
+        return service.start_task(session_id, request.task)
+    except ChatSessionNotFound:
+        raise HTTPException(status_code=404, detail="Чат не найден") from None
+    except TaskConflict as error:
+        raise HTTPException(status_code=409, detail=str(error)) from None
+
+
+@app.post("/api/chat/sessions/{session_id}/task/actions", response_model=ChatSession)
+def task_action(
+    session_id: str,
+    request: TaskActionRequest,
+    service: ChatSessionService = Depends(get_chat_session_service),
+) -> ChatSession:
+    try:
+        return service.task_action(session_id, request)
+    except ChatSessionNotFound:
+        raise HTTPException(status_code=404, detail="Чат не найден") from None
+    except TaskConflict as error:
+        raise HTTPException(status_code=409, detail=str(error)) from None
+    except (AgentOutputError, LlmRequestError) as error:
+        raise HTTPException(status_code=502, detail=str(error)) from None
     except LlmConfigurationError:
         raise HTTPException(status_code=503, detail="DEEPSEEK_API_KEY не задан") from None
 
