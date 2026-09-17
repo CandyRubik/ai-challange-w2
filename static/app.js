@@ -1,4 +1,11 @@
 const API_BASE_URL = (window.API_BASE_URL || "").replace(/\/$/, "");
+const invariantsDialog = document.querySelector("#invariants-dialog");
+const invariantsForm = document.querySelector("#invariants-form");
+const invariantFields = document.querySelector("#invariants-fields");
+const invariantError = document.querySelector("#invariant-error");
+const saveInvariantsButton = document.querySelector("#save-invariants");
+let invariantSettings = null;
+let invariantSaving = false;
 const sessionList = document.querySelector("#sessions");
 const messages = document.querySelector("#messages");
 const title = document.querySelector("#chat-title");
@@ -117,6 +124,120 @@ async function api(path, options = {}) {
   }
   return response.status === 204 ? null : response.json();
 }
+
+function invariantPayload() {
+  const minimum = Number(document.querySelector("#min-emojis").value);
+  const maximum = Number(document.querySelector("#max-sentences").value);
+  const bounded = (value, previous) => Number.isInteger(value) && value >= 1 && value <= 10 ? value : previous;
+  const emojiEnabled = document.querySelector("#emoji-enabled").checked;
+  const sentencesEnabled = document.querySelector("#sentence-limit-enabled").checked;
+  return {
+    emoji_enabled: emojiEnabled,
+    min_emojis: emojiEnabled ? minimum : bounded(minimum, invariantSettings?.min_emojis || 3),
+    uppercase_enabled: document.querySelector("#uppercase-enabled").checked,
+    sentence_limit_enabled: sentencesEnabled,
+    max_sentences: sentencesEnabled ? maximum : bounded(maximum, invariantSettings?.max_sentences || 3),
+    revision: invariantSettings?.revision,
+  };
+}
+
+function renderInvariantPreview() {
+  const settings = invariantPayload();
+  document.querySelector("#min-emojis").disabled = !settings.emoji_enabled;
+  document.querySelector("#max-sentences").disabled = !settings.sentence_limit_enabled;
+  const sentences = ["Небо кажется голубым.", "Атмосфера рассеивает солнечный свет.", "Синий свет рассеивается сильнее красного."];
+  const count = settings.sentence_limit_enabled ? Math.max(1, settings.max_sentences || 1) : 3;
+  let example = sentences.slice(0, count).join(" ");
+  if (settings.uppercase_enabled) example = example.toUpperCase();
+  if (settings.emoji_enabled) example += " " + [..."💬✨🙂✅🌟🔹🟢📌🎯💡"].slice(0, Math.min(10, Math.max(1, settings.min_emojis || 1))).join(" ");
+  document.querySelector("#invariant-preview-text").textContent = example;
+}
+
+function renderActiveInvariants() {
+  const container = document.querySelector("#active-invariants");
+  container.replaceChildren();
+  const settings = invariantSettings;
+  if (!settings) {
+    document.querySelector("#invariant-count").textContent = "?";
+    return;
+  }
+  const rules = [];
+  if (settings.emoji_enabled) rules.push([`🙂 ≥ ${settings.min_emojis}`, "Обязательные эмодзи"]);
+  if (settings.uppercase_enabled) rules.push(["АБВ", "Только верхний регистр"]);
+  if (settings.sentence_limit_enabled) rules.push([`≤ ${settings.max_sentences} предл.`, "Лимит предложений"]);
+  document.querySelector("#invariant-count").textContent = String(rules.length);
+  for (const [text, name] of rules) {
+    const chip = document.createElement("button");
+    chip.type = "button";
+    chip.textContent = text;
+    chip.title = `${name} — открыть инварианты`;
+    chip.addEventListener("click", openInvariants);
+    container.append(chip);
+  }
+}
+
+async function loadInvariants() {
+  invariantSettings = await api("/api/invariants");
+  renderActiveInvariants();
+}
+
+async function openInvariants() {
+  if (invariantSaving) return;
+  invariantError.hidden = true;
+  invariantFields.disabled = true;
+  saveInvariantsButton.disabled = true;
+  if (!invariantsDialog.open) invariantsDialog.showModal();
+  try {
+    await loadInvariants();
+    const settings = invariantSettings;
+    document.querySelector("#emoji-enabled").checked = settings.emoji_enabled;
+    document.querySelector("#min-emojis").value = settings.min_emojis;
+    document.querySelector("#uppercase-enabled").checked = settings.uppercase_enabled;
+    document.querySelector("#sentence-limit-enabled").checked = settings.sentence_limit_enabled;
+    document.querySelector("#max-sentences").value = settings.max_sentences;
+    renderInvariantPreview();
+    invariantFields.disabled = false;
+    saveInvariantsButton.disabled = false;
+  } catch (error) {
+    invariantError.textContent = error.message;
+    invariantError.hidden = false;
+  }
+}
+
+function closeInvariants() {
+  if (!invariantSaving) invariantsDialog.close();
+}
+
+document.querySelector("#open-invariants").addEventListener("click", openInvariants);
+document.querySelector("#close-invariants").addEventListener("click", closeInvariants);
+document.querySelector("#cancel-invariants").addEventListener("click", closeInvariants);
+invariantsForm.addEventListener("input", renderInvariantPreview);
+invariantsDialog.addEventListener("cancel", (event) => { if (invariantSaving) event.preventDefault(); });
+invariantsDialog.addEventListener("click", (event) => { if (event.target === invariantsDialog) closeInvariants(); });
+invariantsForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (invariantSaving || !invariantsForm.reportValidity()) return;
+  const payload = invariantPayload();
+  invariantSaving = true;
+  saveInvariantsButton.disabled = true;
+  invariantFields.disabled = true;
+  saveInvariantsButton.textContent = "Сохраняем…";
+  invariantError.hidden = true;
+  try {
+    invariantSettings = await api("/api/invariants", { method: "PUT", body: JSON.stringify(payload) });
+    renderActiveInvariants();
+    invariantsDialog.close();
+    status.textContent = "Инварианты сохранены";
+  } catch (error) {
+    invariantError.textContent = error.message;
+    invariantError.hidden = false;
+  } finally {
+    invariantSaving = false;
+    saveInvariantsButton.disabled = false;
+    invariantFields.disabled = false;
+    saveInvariantsButton.textContent = "Сохранить";
+  }
+});
 
 function setBusy(value) {
   busy = value;
@@ -647,10 +768,11 @@ function renderMessages(items, updateState = true) {
     const article = document.createElement("article");
     const kind = message.kind || "message";
     article.className = `message ${message.role} ${kind}`;
+    if (message.refusal && message.role === "assistant") article.classList.add("invariant-refusal");
     const label = document.createElement("span");
     label.textContent = kind === "command"
       ? "Команда памяти"
-      : (message.role === "user" ? "Вы" : "Агент");
+      : (message.role === "user" ? "Вы" : (message.refusal ? "Отказ · Инварианты" : "Агент"));
     let content;
     if (kind === "pending") {
       content = document.createElement("div");
@@ -681,7 +803,7 @@ function emptyMemory(text) {
 
 function renderShortTermMemory() {
   const shortTermMessages = currentMessages.filter((message) => (
-    (message.kind || "message") === "message"
+    (message.kind || "message") === "message" && !message.refusal
   ));
   shortTermCount.textContent = String(shortTermMessages.length);
   const recent = shortTermMessages.slice(-6);
@@ -1123,4 +1245,5 @@ showProcessButton.addEventListener("click", () => {
 
 renderMemory();
 renderQueue();
+loadInvariants().catch(() => { renderActiveInvariants(); });
 loadProfiles();

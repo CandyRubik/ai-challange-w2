@@ -1,4 +1,4 @@
-"""Agent orchestration."""
+"""Storage-agnostic model execution and input/output policies."""
 
 from .agent import (
     Agent,
