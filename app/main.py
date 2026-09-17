@@ -10,9 +10,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from .agents.agent import Agent, AgentInputError, AgentOutputError
-from .agents.memory_extractor import MemoryExtractor
-from .agents.profile_interviewer import ProfileInterviewer
-from .agents.task_state import TaskConflict
+from .invariants import (
+    InvariantSnapshot, InvariantUpdateRequest, InvariantSettingsConflict,
+    SQLiteInvariantRepository,
+)
+from .memory.extractor import MemoryExtractor
+from .orchestration.profile_interviewer import ProfileInterviewer
+from .state.task import TaskConflict
 from .providers.deepseek import (
     DeepSeekProvider,
     LlmConfigurationError,
@@ -33,18 +37,20 @@ from .schemas import (
     TaskActionRequest, TaskStartRequest,
 )
 from .services.chat_sessions import (
-    ChatSessionNotFound,
     ChatSessionService,
+)
+from .storage.chat_sessions import (
+    ChatSessionNotFound,
     DEFAULT_CHAT_DB_PATH,
     SQLiteChatSessionRepository,
 )
-from .services.memory import (
+from .memory.service import (
     MemoryNotFound,
     MemoryService,
     MemoryValidationError,
     SQLiteMemoryRepository,
 )
-from .services.profiles import (
+from .orchestration.profiles import (
     DEFAULT_PROFILE_ID,
     ProfileDeletionError,
     ProfileNotFound,
@@ -101,7 +107,32 @@ def get_chat_session_service() -> ChatSessionService:
         memory_extractor,
         get_profile_repository(),
         ProfileInterviewer(provider),
+        invariant_repository=get_invariant_repository(),
     )
+
+
+@lru_cache(maxsize=1)
+def get_invariant_repository() -> SQLiteInvariantRepository:
+    database_path = os.getenv("CHAT_DB_PATH") or str(DEFAULT_CHAT_DB_PATH)
+    return SQLiteInvariantRepository(database_path)
+
+
+@app.get("/api/invariants", response_model=InvariantSnapshot)
+def get_invariants(
+    repository: SQLiteInvariantRepository = Depends(get_invariant_repository),
+) -> InvariantSnapshot:
+    return repository.get()
+
+
+@app.put("/api/invariants", response_model=InvariantSnapshot)
+def update_invariants(
+    request: InvariantUpdateRequest,
+    repository: SQLiteInvariantRepository = Depends(get_invariant_repository),
+) -> InvariantSnapshot:
+    try:
+        return repository.update(request)
+    except InvariantSettingsConflict as error:
+        raise HTTPException(status_code=409, detail=str(error)) from None
 
 
 def get_memory_service() -> MemoryService:
@@ -292,10 +323,14 @@ def send_chat_message(
 def start_task(
     session_id: str,
     request: TaskStartRequest,
+    response: Response,
     service: ChatSessionService = Depends(get_chat_session_service),
 ) -> ChatSession:
     try:
-        return service.start_task(session_id, request.task)
+        session = service.start_task(session_id, request.task)
+        if session.task is None:
+            response.status_code = 200
+        return session
     except ChatSessionNotFound:
         raise HTTPException(status_code=404, detail="Чат не найден") from None
     except TaskConflict as error:

@@ -142,6 +142,41 @@ textarea { resize: none; border: 1px solid #353b5c; border-radius: 14px; padding
 
 dialog { width: min(620px, calc(100% - 32px)); border: 1px solid #41486d; border-radius: 18px; padding: 0; color: #eef1ff; background: #101422; box-shadow: 0 28px 90px #000c; }
 dialog::backdrop { background: #05070bbb; backdrop-filter: blur(4px); }
+.invariants-menu { display: flex; align-items: center; justify-content: space-between; }
+.invariants-menu span { border-radius: 6px; background: #353058; padding: 2px 7px; color: #c5baff; font-size: 11px; }
+.active-invariants { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.active-invariants:empty { display: none; }
+.active-invariants button { padding: 3px 7px; border: 1px solid #504571; border-radius: 6px; color: #d2c7fb; background: #28213d; cursor: pointer; font-size: 10px; }
+#invariants-dialog { max-height: calc(100dvh - 32px); overflow-y: auto; }
+#invariants-form { display: grid; gap: 12px; padding: 20px; }
+#invariants-form > header, #invariants-form > footer { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+#invariants-form h2 { margin: 4px 0 0; }
+#invariants-form .icon-button { min-height: 36px; font-size: 22px; }
+.invariant-intro { margin: 0; color: #aeb4cc; font-size: 13px; line-height: 1.5; }
+#invariants-fields { display: grid; gap: 10px; border: 0; padding: 0; margin: 0; min-width: 0; }
+.invariant-card { padding: 16px; border: 1px solid #363c58; border-radius: 12px; background: #191d2d; }
+.invariant-card-heading { display: flex; align-items: center; gap: 12px; }
+.invariant-card-heading label { flex: 1; font-size: 14px; font-weight: 700; cursor: pointer; }
+.invariant-symbol { display: grid; place-items: center; width: 34px; height: 34px; border-radius: 9px; background: #2c2844; color: #c1b3ff; font-size: 18px; font-weight: 700; }
+.emoji-rule .invariant-symbol { background: #413423; }
+.sentence-rule .invariant-symbol { background: #173b36; color: #8de6cf; }
+.invariant-card input[type="checkbox"] { appearance: none; flex: 0 0 40px; width: 40px; height: 23px; padding: 0; margin: 0; border: 1px solid #50576f; border-radius: 20px; background: #2b3044; cursor: pointer; }
+.invariant-card input[type="checkbox"]::before { content: ""; display: block; width: 15px; height: 15px; margin: 3px; border-radius: 50%; background: #9ca4be; transition: transform .15s; }
+.invariant-card input[type="checkbox"]:checked { background: #7665e9; border-color: #9686ff; }
+.invariant-card input[type="checkbox"]:checked::before { transform: translateX(17px); background: #fff; }
+.invariant-card input:focus-visible, .active-invariants button:focus-visible { outline: 2px solid #beafff; outline-offset: 3px; }
+.invariant-card p { margin: 10px 0 0; color: #929ab6; font-size: 12px; line-height: 1.5; }
+.invariant-number { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 12px; color: #bec5dc; font-size: 12px; }
+.invariant-number input { width: 70px; padding: 6px 9px; border: 1px solid #454c69; border-radius: 7px; background: #101422; color: #fff; }
+.invariant-number input:disabled { opacity: .4; }
+.invariant-preview { padding: 14px 16px; border: 1px dashed #514974; border-radius: 10px; background: #1d192d; }
+.invariant-preview > span { color: #a99acb; font-size: 10px; letter-spacing: .1em; }
+.invariant-preview p { margin: 8px 0 0; color: #e0d7f9; font-size: 13px; line-height: 1.7; overflow-wrap: anywhere; }
+.invariant-footnote { margin: 0; color: #929ab6; font-size: 11px; line-height: 1.5; }
+#invariant-error { color: #ffb8c4; margin: 0; font-size: 12px; }
+#invariants-form > footer { position: sticky; bottom: -20px; z-index: 1; justify-content: flex-end; border-top: 1px solid #282d48; padding: 14px 0 20px; margin-bottom: -20px; background: #101422; }
+.message.invariant-refusal { border-color: #85613a; background: #282116; }
+.message.invariant-refusal > span { color: #eac28c; }
 #profile-form { display: grid; gap: 16px; padding: 22px; }
 #profile-form > header, #profile-form > footer { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 #profile-form > header h2 { margin-top: 4px; }

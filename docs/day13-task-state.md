@@ -32,10 +32,14 @@ stateDiagram-v2
 
 ## Код
 
-- `app/agents/task_state.py` — неизменяемые dataclass, таблица переходов и правила прогресса;
+- `app/state/task.py` — неизменяемые dataclass, таблица переходов и правила прогресса;
 - `app/agents/task_outputs.py` — строгие схемы ответов планирования и проверки;
 - `app/agents/agent.py` — обработчики этапов, получающие полный снимок задачи;
-- `app/services/chat_sessions.py` — SQLite, атомарное сохранение снимка и сообщений, версии состояния;
+- `app/orchestration/tasks.py` — выбор этапа агента и применение переходов;
+- `app/orchestration/context.py` — активный профиль отдельно от памяти и состояния задачи;
+- `app/memory/context.py` — отдельный снимок working и long-term memory;
+- `app/storage/chat_sessions.py` — SQLite, атомарное сохранение снимка и сообщений, версии состояния;
+- `app/services/chat_sessions.py` — координация запроса и адаптация HTTP-моделей;
 - `app/main.py` и `app/schemas.py` — API задач;
 - `static/` — схема этапов над чатом, цепочка шагов в правой панели и управление задачей;
 - `tests/test_task_state.py` и `tests/test_tasks.py` — проверки переходов и полного цикла.

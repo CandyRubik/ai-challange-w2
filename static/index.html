@@ -6,7 +6,7 @@
     <meta name="description" content="Чат с агентом и автоматической трёхслойной памятью" />
     <title>Rubik Agent Chat</title>
     <link rel="icon" href="data:," />
-    <link rel="stylesheet" href="/styles.css?v=task-state-4" />
+    <link rel="stylesheet" href="/styles.css?v=invariants-1" />
   </head>
   <body>
     <main class="chat-shell">
@@ -21,6 +21,7 @@
           <button id="new-profile" class="secondary" type="button">＋ Новый пользователь</button>
         </section>
         <button id="new-session" class="primary" type="button">＋ Новый чат</button>
+        <button id="open-invariants" class="secondary invariants-menu" type="button">Инварианты <span id="invariant-count">…</span></button>
         <nav id="sessions" aria-label="Сессии чата"></nav>
         <button id="clear-database" class="danger" type="button">Очистить чаты профиля</button>
 
@@ -32,6 +33,7 @@
           <div>
             <p class="eyebrow">CODE-ISOLATED AGENT CHAT</p>
             <h1 id="chat-title">Новый чат</h1>
+            <div id="active-invariants" class="active-invariants" aria-label="Активные инварианты"></div>
           </div>
           <div class="header-actions">
             <button id="refresh-session" class="secondary" type="button">Обновить</button>
@@ -179,6 +181,48 @@
       </aside>
     </main>
 
+    <dialog id="invariants-dialog" aria-labelledby="invariants-title">
+      <form id="invariants-form">
+        <header>
+          <div><p class="eyebrow">ПРАВИЛА ОТВЕТОВ</p><h2 id="invariants-title">Инварианты</h2></div>
+          <button id="close-invariants" class="icon-button" type="button" aria-label="Закрыть инварианты">×</button>
+        </header>
+        <p class="invariant-intro">Общие правила для всех профилей. Просьба в диалоге не может их отменить.</p>
+        <fieldset id="invariants-fields">
+          <section class="invariant-card emoji-rule">
+            <div class="invariant-card-heading">
+              <span class="invariant-symbol" aria-hidden="true">🙂</span>
+              <label for="emoji-enabled">Без эмодзи нельзя</label>
+              <input id="emoji-enabled" type="checkbox" role="switch" />
+            </div>
+            <p>Каждый ответ, включая отказ, содержит эмодзи.</p>
+            <label class="invariant-number" for="min-emojis">Минимум эмодзи <input id="min-emojis" type="number" min="1" max="10" required value="3" /></label>
+          </section>
+          <section class="invariant-card uppercase-rule">
+            <div class="invariant-card-heading">
+              <span class="invariant-symbol" aria-hidden="true">Аа</span>
+              <label for="uppercase-enabled">Только ВЕРХНИЙ РЕГИСТР</label>
+              <input id="uppercase-enabled" type="checkbox" role="switch" />
+            </div>
+            <p>Весь текст ответа — заглавными буквами.</p>
+          </section>
+          <section class="invariant-card sentence-rule">
+            <div class="invariant-card-heading">
+              <span class="invariant-symbol" aria-hidden="true">…</span>
+              <label for="sentence-limit-enabled">Коротко и по делу</label>
+              <input id="sentence-limit-enabled" type="checkbox" role="switch" />
+            </div>
+            <p>Ответ не превышает лимит предложений; длинный ответ не обрезается молча.</p>
+            <label class="invariant-number" for="max-sentences">Максимум предложений <input id="max-sentences" type="number" min="1" max="10" required value="3" /></label>
+          </section>
+        </fieldset>
+        <section class="invariant-preview" aria-label="Пример формата ответа"><span>ПРИМЕР ФОРМАТА</span><p id="invariant-preview-text"></p></section>
+        <p class="invariant-footnote">После сохранения правила применяются к новым запросам. Уже начатый ответ использует прежние настройки.</p>
+        <p id="invariant-error" role="alert" hidden></p>
+        <footer><button id="cancel-invariants" class="secondary" type="button">Отмена</button><button id="save-invariants" class="primary" type="submit">Сохранить</button></footer>
+      </form>
+    </dialog>
+
     <dialog id="profile-dialog">
       <form id="profile-form">
         <header>
@@ -242,6 +286,6 @@
         </footer>
       </form>
     </dialog>
-    <script src="/app.js?v=task-state-4" defer></script>
+    <script src="/app.js?v=invariants-1" defer></script>
   </body>
 </html>

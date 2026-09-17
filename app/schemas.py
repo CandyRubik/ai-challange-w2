@@ -26,6 +26,7 @@ class ChatMessage(StrictModel):
     id: str
     role: Literal["user", "assistant"]
     kind: Literal["message", "command"] = "message"
+    refusal: bool = False
     content: str
     created_at: datetime
 
