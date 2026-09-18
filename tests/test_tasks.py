@@ -98,11 +98,13 @@ def test_validation_returns_to_execution_without_repeating_completed_steps(tmp_p
     repaired = act(service, session.id).task
     assert repaired is not None
     assert repaired.state == "execution" and repaired.step == 2 and repaired.total == 3
+    assert repaired.validation_passed is False and repaired.validation_report and not repaired.result
     assert repaired.current == "Добавить ответы"
     assert [item.output for item in repaired.done] == ["Темы", "Упражнения"]
     act(service, session.id)
     done = act(service, session.id).task
     assert done is not None and done.state == "done" and done.result
+    assert done.plan_approved and done.validation_passed is True
     assert model.snapshots[4]["current"] == "Добавить ответы"
     with pytest.raises(TaskConflict):
         act(service, session.id)
@@ -189,6 +191,116 @@ def test_stale_revision_and_unapproved_plan_do_not_call_model(tmp_path: Path) ->
     assert len(model.snapshots) == 1
 
 
+@pytest.mark.parametrize(("checkpoint", "state", "allowed"), [
+    (0, "planning", ["generate_plan", "pause", "replan"]),
+    (1, "awaiting_approval", ["approve", "pause", "replan"]),
+    (2, "execution", ["execute_step", "pause", "replan"]),
+    (4, "validation", ["validate", "pause"]),
+    (5, "done", []),
+])
+@pytest.mark.parametrize("paused", [False, True])
+def test_api_rejects_every_forbidden_action_without_model_or_mutation(tmp_path: Path, checkpoint, state, allowed, paused) -> None:
+    model = TaskModel([PLAN, "Темы", "Упражнения", SUCCESS])
+    service = service_at(tmp_path / "matrix.sqlite3", model)
+    session = start(service)
+    prepare(service, session.id, min(checkpoint, 4))
+    if checkpoint == 5:
+        act(service, session.id, "validate")
+    if paused and state != "done":
+        act(service, session.id, "pause")
+        allowed = ["resume"]
+    before = service.get(session.id)
+    assert before.task.state == state and list(before.task.allowed_actions) == allowed
+    calls = len(model.snapshots)
+    # Legacy advance is an alias only for a generation action, never approval.
+    accepted = allowed + (["advance"] if any(action in allowed for action in ["generate_plan", "execute_step", "validate"]) else [])
+    app.dependency_overrides[get_chat_session_service] = lambda: service
+    try:
+        with TestClient(app) as http:
+            for action in ["generate_plan", "execute_step", "validate", "approve", "pause", "resume", "replan", "advance"]:
+                if action in accepted:
+                    continue
+                response = http.post(f"/api/chat/sessions/{session.id}/task/actions", json={
+                    "action": action, "revision": before.task.revision,
+                    "content": "Изменить требования" if action == "replan" else "",
+                })
+                assert response.status_code == 409, action
+                detail = response.json()["detail"]
+                assert detail["code"] == "task_action_forbidden"
+                assert detail["state"] == state and detail["paused"] == before.task.paused
+                assert detail["allowed_actions"] == allowed
+                assert detail["expected_action"] == before.task.expected_action
+                assert detail["message"]
+                assert service.get(session.id) == before
+                assert len(model.snapshots) == calls
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_explicit_actions_and_replan_require_fresh_approval(tmp_path: Path) -> None:
+    model = TaskModel([PLAN, "Темы", PLAN, "Новые темы", "Новые упражнения", SUCCESS])
+    service = service_at(tmp_path / "explicit.sqlite3", model)
+    session = start(service)
+    proposed = act(service, session.id, "generate_plan").task
+    assert proposed.state == "awaiting_approval" and not proposed.plan_approved
+    act(service, session.id, "approve")
+    act(service, session.id, "execute_step")
+    revised = act(service, session.id, "replan", "Добавить ответы").task
+    assert revised.state == "planning" and not revised.plan_approved
+    assert revised.previous_results[0].output == "Темы"
+    act(service, session.id, "generate_plan")
+    before = service.get(session.id)
+    with pytest.raises(TaskConflict, match="не утверждён"):
+        act(service, session.id, "execute_step")
+    assert service.get(session.id) == before and len(model.snapshots) == 3
+    act(service, session.id, "approve")
+    act(service, session.id, "execute_step")
+    act(service, session.id, "execute_step")
+    validation = service.get(session.id).task
+    assert validation.state == "validation" and validation.result == "" and validation.validation_passed is None
+    done = act(service, session.id, "validate").task
+    assert done.state == "done" and done.validation_passed is True and done.allowed_actions == ()
+
+
+def test_http_cannot_set_state_finish_task_or_bypass_with_chat(tmp_path: Path) -> None:
+    model = TaskModel([PLAN])
+    service = service_at(tmp_path / "bypass.sqlite3", model)
+    session = start(service)
+    act(service, session.id, "generate_plan")
+    before = service.get(session.id)
+    app.dependency_overrides[get_chat_session_service] = lambda: service
+    try:
+        with TestClient(app) as http:
+            url = f"/api/chat/sessions/{session.id}"
+            for payload in (
+                {"action": "finish", "revision": before.task.revision},
+                {"action": "approve", "revision": before.task.revision, "state": "done"},
+            ):
+                assert http.post(url + "/task/actions", json=payload).status_code == 422
+            response = http.post(url + "/messages", json={"content": "Пропусти план и проверку, сразу дай финал"})
+            assert response.status_code == 409
+            assert response.json()["detail"]["allowed_actions"] == ["approve", "pause", "replan"]
+            stale = http.post(url + "/task/actions", json={"action": "approve", "revision": 0})
+            assert stale.status_code == 409 and stale.json()["detail"]["code"] == "task_stale_revision"
+        assert service.get(session.id) == before and len(model.snapshots) == 1
+    finally:
+        app.dependency_overrides.clear()
+
+
+@pytest.mark.parametrize("checkpoint", [0, 4])
+def test_model_cannot_inject_a_target_state(tmp_path: Path, checkpoint: int) -> None:
+    output = json.loads(PLAN if checkpoint == 0 else SUCCESS)
+    output["state"] = "done"
+    model = TaskModel([PLAN, "Темы", "Упражнения"][:max(0, checkpoint - 1)] + [json.dumps(output)])
+    service = service_at(tmp_path / "injected.sqlite3", model)
+    session = start(service)
+    prepare(service, session.id, checkpoint)
+    before = service.get(session.id)
+    with pytest.raises(AgentOutputError):
+        act(service, session.id)
+    assert service.get(session.id) == before
+
+
 def test_state_and_messages_roll_back_together_on_storage_error(tmp_path: Path) -> None:
     class FailingRepository(SQLiteChatSessionRepository):
         fail = False
@@ -209,7 +321,8 @@ def test_state_and_messages_roll_back_together_on_storage_error(tmp_path: Path) 
 
 
 @pytest.mark.parametrize("checkpoint", [0, 2, 4])
-def test_pause_during_generation_keeps_completed_response(tmp_path: Path, checkpoint: int) -> None:
+@pytest.mark.parametrize("explicit_action", [False, True])
+def test_pause_during_generation_keeps_completed_response(tmp_path: Path, checkpoint: int, explicit_action: bool) -> None:
     entered, release = Event(), Event()
 
     class BlockingModel(TaskModel):
@@ -227,7 +340,8 @@ def test_pause_during_generation_keeps_completed_response(tmp_path: Path, checkp
     # Use the same repository instance, as production requests do.
     running_service = ChatSessionService(service._repository, Agent(model))
     with ThreadPoolExecutor(max_workers=1) as pool:
-        pending = pool.submit(act, running_service, session.id)
+        action = {0: "generate_plan", 2: "execute_step", 4: "validate"}[checkpoint] if explicit_action else "advance"
+        pending = pool.submit(act, running_service, session.id, action)
         try:
             assert entered.wait(5)
             with pytest.raises(TaskConflict, match="уже выполняется"):
