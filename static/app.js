@@ -60,7 +60,7 @@ const advanceButton = document.querySelector("#task-advance");
 const pauseButton = document.querySelector("#task-pause");
 const resumeButton = document.querySelector("#task-resume");
 const replanButton = document.querySelector("#task-replan");
-const STAGES = { planning: "Планирование", execution: "Выполнение", validation: "Проверка", done: "Готово" };
+const STAGES = { planning: "Планирование", awaiting_approval: "Утверждение", execution: "Выполнение", validation: "Проверка", done: "Готово" };
 const ACTIONS = { generate_plan: "Сформировать план", approve_plan: "Утвердить план", execute_step: "Выполнить шаг", validate: "Проверить результат", none: "Задача завершена" };
 let currentSession = null;
 let taskRunning = false;
@@ -269,18 +269,20 @@ function syncControls() {
   taskToolbar.hidden = !active;
   input.placeholder = "Сообщение или /команда…";
   if (!task) return;
+  const allowed = task.allowed_actions;
+  const nextAction = task.expected_action === "approve_plan" ? "approve" : task.expected_action;
   advanceButton.textContent = taskRunning ? "Выполняется…" : ACTIONS[task.expected_action];
   advanceButton.hidden = task.state === "done";
-  advanceButton.disabled = blocked || task.paused;
-  pauseButton.hidden = task.paused || task.state === "done";
+  advanceButton.disabled = blocked || !allowed.includes(nextAction);
+  pauseButton.hidden = !allowed.includes("pause");
   pauseButton.disabled = controlBusy || (busy && !taskRunning);
-  resumeButton.hidden = !task.paused;
+  resumeButton.hidden = !allowed.includes("resume");
   resumeButton.disabled = blocked;
-  replanButton.hidden = !["planning", "execution"].includes(task.state);
-  replanButton.disabled = blocked || task.paused;
+  replanButton.hidden = !allowed.includes("replan");
+  replanButton.disabled = blocked;
   document.querySelector("#task-note").textContent = task.paused
     ? (taskRunning ? "Пауза запрошена. Текущий ответ завершится и сохранится; следующий шаг не начнётся." : "Состояние сохранено. «Продолжить» снимет паузу, затем можно выполнить ожидаемое действие.")
-    : (task.state === "done" ? "Итог сохранён в истории и результатах задачи. Для новой задачи создайте новый чат." : "Одно нажатие выполняет одно действие. Состояние сохраняется после каждого действия.");
+    : (task.state === "done" ? "Итог сохранён в истории и результатах задачи. Для новой задачи создайте новый чат." : task.state === "awaiting_approval" ? "Выполнение заблокировано до утверждения плана. Можно утвердить план или указать изменения." : "Одно нажатие выполняет одно действие. Состояние сохраняется после каждого действия.");
   renderTaskActivity(task);
 }
 
@@ -303,6 +305,7 @@ function setInspector(mode) {
 function taskIcon(name) {
   const paths = {
     planning: '<path d="M8 5h12M8 12h12M8 19h12M3 5h.01M3 12h.01M3 19h.01"/>',
+    awaiting_approval: '<path d="M9 4h6M9 3h6v4H9zM9 5H5v16h14V5h-4M8 14l3 3 5-6"/>',
     execution: '<path d="m8 5 10 7-10 7z"/>',
     validation: '<circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/>',
     done: '<path d="m5 12 4 4L19 6"/>',
@@ -1188,7 +1191,7 @@ async function runTaskAction(action, content = "") {
   const isPause = action === "pause";
   if (isPause) controlBusy = true;
   else {
-    taskRunning = action === "advance";
+    taskRunning = ["advance", "generate_plan", "execute_step", "validate"].includes(action);
     taskError = "";
     if (taskRunning) startTaskActivity(task);
     setBusy(true);
@@ -1217,7 +1220,7 @@ async function runTaskAction(action, content = "") {
   }
 }
 
-advanceButton.addEventListener("click", () => runTaskAction(currentSession.task.expected_action === "approve_plan" ? "approve" : "advance"));
+advanceButton.addEventListener("click", () => runTaskAction(currentSession.task.expected_action === "approve_plan" ? "approve" : currentSession.task.expected_action));
 pauseButton.addEventListener("click", () => runTaskAction("pause"));
 resumeButton.addEventListener("click", () => runTaskAction("resume"));
 replanButton.addEventListener("click", () => {

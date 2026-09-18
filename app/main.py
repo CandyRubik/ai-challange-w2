@@ -310,7 +310,7 @@ def send_chat_message(
     except ProfileNotFound:
         raise HTTPException(status_code=404, detail="Профиль не найден") from None
     except TaskConflict as error:
-        raise HTTPException(status_code=409, detail=str(error)) from None
+        raise HTTPException(status_code=409, detail=error.detail) from None
     except AgentInputError as error:
         raise HTTPException(status_code=422, detail=str(error)) from None
     except (AgentOutputError, LlmRequestError) as error:
@@ -334,7 +334,7 @@ def start_task(
     except ChatSessionNotFound:
         raise HTTPException(status_code=404, detail="Чат не найден") from None
     except TaskConflict as error:
-        raise HTTPException(status_code=409, detail=str(error)) from None
+        raise HTTPException(status_code=409, detail=error.detail) from None
 
 
 @app.post("/api/chat/sessions/{session_id}/task/actions", response_model=ChatSession)
@@ -348,7 +348,7 @@ def task_action(
     except ChatSessionNotFound:
         raise HTTPException(status_code=404, detail="Чат не найден") from None
     except TaskConflict as error:
-        raise HTTPException(status_code=409, detail=str(error)) from None
+        raise HTTPException(status_code=409, detail=error.detail) from None
     except (AgentOutputError, LlmRequestError) as error:
         raise HTTPException(status_code=502, detail=str(error)) from None
     except LlmConfigurationError:

@@ -35,8 +35,11 @@ class TaskStartRequest(StrictModel):
     task: Annotated[str, Field(min_length=1, max_length=12_000)]
 
 
+TaskAction = Literal["generate_plan", "execute_step", "validate", "approve", "pause", "resume", "replan"]
+
+
 class TaskActionRequest(StrictModel):
-    action: Literal["advance", "approve", "pause", "resume", "replan"]
+    action: Literal["advance", "generate_plan", "execute_step", "validate", "approve", "pause", "resume", "replan"]
     revision: Annotated[int, Field(ge=0)]
     content: Annotated[str, Field(max_length=4_000)] = ""
 
@@ -50,7 +53,7 @@ class TaskActionRequest(StrictModel):
 
 
 class TaskSummary(StrictModel):
-    state: Literal["planning", "execution", "validation", "done"]
+    state: Literal["planning", "awaiting_approval", "execution", "validation", "done"]
     step: int
     total: int
     current: str
@@ -73,6 +76,9 @@ class TaskView(TaskSummary):
     previous_results: tuple[TaskStepResult, ...]
     validation_report: str
     result: str
+    plan_approved: bool
+    validation_passed: bool | None
+    allowed_actions: tuple[TaskAction, ...]
 
 
 class ChatSessionSummary(StrictModel):

@@ -2,5 +2,5 @@
 
 from ..state.task import (
     TRANSITIONS, StepResult, TaskConflict, TaskContext, TaskState,
-    approve_plan, complete_step, pause, replan, resume, transition,
+    apply_validation, approve_plan, complete_step, pause, propose_plan, replan, require_action, resume,
 )

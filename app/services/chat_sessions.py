@@ -13,7 +13,7 @@ from ..schemas import (
     ChatMessage, ChatSendResponse, ChatSession, ChatSessionSummary,
     TaskActionRequest, TaskSummary, TaskView,
 )
-from ..state.task import TaskContext, TaskConflict, TaskState, approve_plan, pause, replan, resume
+from ..state.task import TaskContext, TaskConflict, TaskState, approve_plan, pause, replan, require_action, resume
 from ..memory.service import MemoryRepository
 from ..storage.chat_sessions import (
     ChatSessionNotFound, ChatSessionRepository, DEFAULT_CHAT_DB_PATH,
@@ -197,7 +197,11 @@ class ChatSessionService:
     def _send(self, session_id: str, content: str, policy: InvariantPolicy) -> ChatSendResponse:
         session = self._repository.get(session_id)
         if session.task is not None and session.task.context.state != TaskState.DONE:
-            raise TaskConflict("Используйте действия задачи или пересмотрите план")
+            ctx = session.task.context
+            raise TaskConflict(
+                f"Используйте действия задачи. Следующее действие: {ctx.current}", ctx=ctx,
+                code="task_action_forbidden",
+            )
         policy.check_request(content)
         profile = None
         if self._profile_repository is not None:
@@ -282,10 +286,13 @@ class ChatSessionService:
         if stored is None:
             raise TaskConflict("В чате нет задачи")
         if request.revision != stored.revision:
-            raise TaskConflict("Состояние изменилось. Обновите чат и повторите действие")
+            raise TaskConflict(
+                "Состояние изменилось. Обновите чат и повторите действие",
+                ctx=stored.context, code="task_stale_revision",
+            )
         ctx = stored.context
-        action = request.action
-        if action in {"advance", "approve", "replan"}:
+        action = require_action(ctx, request.action)
+        if action not in {"pause", "resume"}:
             policy.check_request(request.content if action == "replan" else ctx.task + "\n" + "\n".join(ctx.notes))
         if action == "pause":
             updated, answer = pause(ctx), "Задача на паузе — этап, шаг и результаты сохранены"
@@ -299,8 +306,6 @@ class ChatSessionService:
             updated = replan(ctx, request.content)
             answer = "Требования сохранены — сформируйте новый план, готовые результаты доступны агенту"
         else:
-            if ctx.paused:
-                raise TaskConflict("Задача на паузе. Сначала нажмите «Продолжить»")
             profile = None if self._profile_repository is None else profile_context(
                 self._profile_repository.get(session.profile_id),
             )
@@ -308,10 +313,11 @@ class ChatSessionService:
             updated, answer = self._tasks.advance(
                 ctx, orchestration=OrchestrationContext(profile=profile, invariants=policy.settings), memory=memory,
             )
-        is_generation = action == "advance"
+        is_generation = action in {"generate_plan", "execute_step", "validate"}
         self._repository.update_task(
             session_id, updated,
-            {"advance": ctx.current, "approve": "Утвердить план", "pause": "Пауза",
+            {"generate_plan": ctx.current, "execute_step": ctx.current, "validate": ctx.current,
+             "approve": "Утвердить план", "pause": "Пауза",
              "resume": "Продолжить", "replan": "Пересмотреть план: " + request.content}[action],
             policy.apply(answer),
             expected_revision=None if is_generation else request.revision,
